@@ -31,10 +31,10 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.8",
     "@types/node": "^22.0.0",
     "bb-app": "0.39.0",
     "typescript": "^5.7.0",
