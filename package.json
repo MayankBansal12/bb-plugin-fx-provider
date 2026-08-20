@@ -1,0 +1,43 @@
+{
+  "name": "bb-plugin-fx",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.39",
+    "bbPluginSdk": ">=0.4.8"
+  },
+  "bb": {
+    "name": "FX",
+    "description": "Run BB threads with the FX coding agent.",
+    "branding": {
+      "icon": "Zap"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "skills": []
+  },
+  "description": "FX agent provider for BB",
+  "keywords": [
+    "bb-plugin",
+    "fx",
+    "acp",
+    "agent"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
+    "@types/node": "^22.0.0",
+    "bb-app": "0.39.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.11"
+  }
+}
