@@ -2,6 +2,9 @@
 
 Run [fx](https://fx.sh/) as an agent provider inside BB.
 
+<img width="600" height="380" alt="image" src="https://github.com/user-attachments/assets/f9eefc64-6604-4ad1-acf9-1be071d2712f" />
+
+
 The plugin uses fx's Agent Client Protocol (`fx acp`) over stdio and translates
 its sessions, streamed assistant text, tool calls, cancellation, and model
 recovery updates into BB's provider bridge protocol. Each BB thread owns an
