@@ -53,7 +53,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function rpcError(error: JsonRpcErrorShape): Error {
   const message =
-    typeof error.message === "string" ? error.message : "FX ACP request failed";
+    typeof error.message === "string" ? error.message : "fx ACP request failed";
   const code = typeof error.code === "number" ? ` (${error.code})` : "";
   const detail = error.data === undefined ? "" : `: ${JSON.stringify(error.data)}`;
   return new Error(`${message}${code}${detail}`);
@@ -81,6 +81,9 @@ export class FxAcpConnection implements AcpConnection {
     child.stderr.on("data", (chunk: string) => {
       this.#stderr = `${this.#stderr}${chunk}`.slice(-16_384);
     });
+    child.stdin.on("error", () => {
+      // EPIPE during teardown is expected; process exit handles real failures.
+    });
     child.once("error", (error) => this.#handleExit(error));
     child.once("exit", (code, signal) => {
       const stderr = this.#stderr.trim();
@@ -107,7 +110,15 @@ export class FxAcpConnection implements AcpConnection {
         return;
       }
       child.once("spawn", resolve);
-      child.once("error", reject);
+      child.once("error", (error: NodeJS.ErrnoException) => {
+        reject(
+          error.code === "ENOENT"
+            ? new Error(
+                "The fx CLI was not found on PATH. Install fx and sign in with `fx login`.",
+              )
+            : error,
+        );
+      });
     });
     return connection;
   }
@@ -118,7 +129,7 @@ export class FxAcpConnection implements AcpConnection {
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<unknown> {
     if (this.#closed || this.#closing) {
-      return Promise.reject(new Error("FX ACP connection is closed"));
+      return Promise.reject(new Error("fx ACP connection is closed"));
     }
     const id = this.#nextId++;
     return new Promise<unknown>((resolve, reject) => {
@@ -126,7 +137,7 @@ export class FxAcpConnection implements AcpConnection {
       if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
           this.#pending.delete(id);
-          reject(new Error(`FX ACP ${method} timed out after ${timeoutMs}ms`));
+          reject(new Error(`fx ACP ${method} timed out after ${timeoutMs}ms`));
         }, timeoutMs);
       }
       this.#pending.set(id, pending);
@@ -143,25 +154,35 @@ export class FxAcpConnection implements AcpConnection {
     if (this.#closed) return;
     this.#closing = true;
     this.#child.stdin.end();
+    await this.#waitForExit(CLOSE_GRACE_MS);
     if (this.#child.exitCode === null && this.#child.signalCode === null) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          if (this.#child.exitCode === null && this.#child.signalCode === null) {
-            this.#child.kill("SIGTERM");
-          }
-          resolve();
-        }, CLOSE_GRACE_MS);
-        this.#child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
+      this.#child.kill("SIGTERM");
+      await this.#waitForExit(CLOSE_GRACE_MS * 2);
+    }
+    if (this.#child.exitCode === null && this.#child.signalCode === null) {
+      this.#child.kill("SIGKILL");
+      await this.#waitForExit(CLOSE_GRACE_MS * 2);
     }
     this.#closed = true;
-    this.#rejectPending(new Error("FX ACP connection closed"));
+    this.#rejectPending(new Error("fx ACP connection closed"));
+  }
+
+  #waitForExit(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, ms);
+      this.#child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   #write(message: unknown): void {
+    if (this.#closed || this.#closing) return;
     this.#child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
@@ -177,8 +198,7 @@ export class FxAcpConnection implements AcpConnection {
       try {
         message = JSON.parse(line);
       } catch {
-        this.#handleExit(new Error("fx acp emitted invalid JSON-RPC"));
-        return;
+        continue;
       }
       void this.#handleMessage(message);
     }
