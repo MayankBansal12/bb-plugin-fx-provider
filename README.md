@@ -28,10 +28,10 @@ fx models --json
 
 ## Install
 
-Install release v0.2.0 straight from GitHub:
+Install release v0.2.1 straight from GitHub:
 
 ```sh
-bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx.git@v0.2.0 --yes
+bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@v0.2.1 --yes
 ```
 
 For local development:
@@ -65,20 +65,21 @@ rejects fails the turn rather than silently running on a different one.
   in fx's default `ask` mode, so tool approval arrives over ACP
   `session/request_permission`. The bridge is the automatic reviewer BB
   advertises (`permissionModes: ["auto"]`, `approvalEnforcedBy: "provider"`) and
-  answers with fx's single-use allow option. fx's `code` mode is deliberately
-  not selected: its classifier denies `terminal.exec` non-interactively and
-  redirects the model to an ask-user-question tool fx only offers in its own
-  shell.
+  automatically answers with fx's single-use allow option; BB does not show an
+  interactive approval prompt for these requests. fx's `code` mode is
+  deliberately not selected: its classifier denies `terminal.exec`
+  non-interactively and redirects the model to an ask-user-question tool fx
+  only offers in its own shell.
 - `supportsNativeUserQuestion` is `false`. fx's native prompt is ACP
   `elicitation/create`, which this bridge declines because it has no BB surface
   to render it; claiming otherwise would suppress BB's own fallback.
-- No reasoning levels are advertised. fx exposes no reasoning config option
-  over ACP (`session/new` reports only `model` and `mode` on fx 0.0.4), so
-  anything the picker showed would be a label for a setting never applied. BB
-  renders a reasoning row for any advertised level, so the bridge advertises
-  none and BB shows no reasoning control for fx models. If a future fx build
-  reports a `thought_level` config option, the bridge surfaces and forwards
-  those levels automatically.
+- fx models advertise no supported reasoning levels. fx exposes no reasoning
+  config option over ACP (`session/new` reports only `model` and `mode` on fx
+  0.0.4), so BB shows no reasoning control and the bridge forwards no reasoning
+  value. The provider declaration retains BB's required static `medium`
+  fallback, but it is not applied to fx. If a future fx build reports a
+  `thought_level` config option, the bridge surfaces and forwards those levels
+  automatically.
 - Forking, provider-side archive/rename, manual compaction, service tiers, and
   BB workflows are not advertised.
 - fx's built-in retry loop is allowed to run without a bridge timeout. Recovery

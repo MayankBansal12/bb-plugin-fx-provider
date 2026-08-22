@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-fx",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "engines": {
     "bb": ">=0.39",
@@ -27,7 +27,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MayankBansal12/bb-plugin-fx.git"
+    "url": "git+https://github.com/MayankBansal12/bb-plugin-fx-provider.git"
   },
   "scripts": {
     "build": "bb plugin build",
