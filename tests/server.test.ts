@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import plugin from "../server.js";
 
-describe("FX provider registration", () => {
+describe("fx provider registration", () => {
   it("declares only capabilities implemented by the bridge", () => {
     const register = vi.fn();
     plugin({
@@ -11,11 +11,11 @@ describe("FX provider registration", () => {
     expect(register).toHaveBeenCalledOnce();
     expect(register).toHaveBeenCalledWith({
       id: "fx",
-      displayName: "FX",
-      icon: "Zap",
+      displayName: "fx",
+      icon: "./assets/fx.svg",
       capabilities: {
         supportsServiceTier: false,
-        supportsNativeUserQuestion: true,
+        supportsNativeUserQuestion: false,
         fork: "none",
         supportsManualCompaction: false,
         supportsThreadArchive: false,

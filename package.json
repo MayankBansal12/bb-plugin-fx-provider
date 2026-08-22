@@ -1,22 +1,23 @@
 {
   "name": "bb-plugin-fx",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.39",
     "bbPluginSdk": ">=0.4.8"
   },
   "bb": {
-    "name": "FX",
-    "description": "Run BB threads with the FX coding agent.",
+    "name": "fx",
+    "description": "Run BB threads with the fx coding agent.",
     "branding": {
-      "icon": "Zap"
+      "icon": "./assets/fx.svg"
     },
     "server": "./server.ts",
+    "app": "./app.tsx",
     "host": "./host.ts",
     "skills": []
   },
-  "description": "FX agent provider for BB",
+  "description": "fx agent provider for BB",
   "keywords": [
     "bb-plugin",
     "fx",
@@ -24,6 +25,10 @@
     "agent"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MayankBansal12/bb-plugin-fx.git"
+  },
   "scripts": {
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
@@ -36,6 +41,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
     "bb-app": "0.39.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.11"

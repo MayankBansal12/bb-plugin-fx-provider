@@ -12,8 +12,10 @@ import {
   experimental_defineProviderBridge,
   initializeParamsSchema,
   modelListParamsSchema,
+  reasoningLevelValues,
   runBridgeRequest,
   skillsConfigureParamsSchema,
+  threadDiscardParamsSchema,
   threadResumeParamsSchema,
   threadScope,
   threadStartParamsSchema,
@@ -24,8 +26,11 @@ import {
   withoutBridgeRuntimeEnv,
   type AvailableModel,
   type BridgeExecutionOptions,
+  type ModelReasoningEffort,
   type PromptInput,
   type ProviderBridgeDefinition,
+  type ProviderErrorCategory,
+  type ReasoningLevel,
   type ThreadEvent,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { z } from "zod";
@@ -45,6 +50,7 @@ const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
 type ThreadStartParams = z.infer<typeof threadStartParamsSchema>;
 type ThreadResumeParams = z.infer<typeof threadResumeParamsSchema>;
 type ThreadStopParams = z.infer<typeof threadStopParamsSchema>;
+type ThreadDiscardParams = z.infer<typeof threadDiscardParamsSchema>;
 type TurnStartParams = z.infer<typeof turnStartParamsSchema>;
 type TurnSteerParams = z.infer<typeof turnSteerParamsSchema>;
 type SkillsConfigureParams = z.infer<typeof skillsConfigureParamsSchema>;
@@ -64,6 +70,8 @@ interface FxToolItem {
   kind: string;
   result?: string;
   completed: boolean;
+  /** Last progress line emitted, so repeats are not re-sent to the timeline. */
+  lastProgress?: string;
 }
 
 interface FxTurn {
@@ -83,11 +91,15 @@ interface FxSession {
   connection: AcpConnection;
   cwd: string;
   model?: string;
+  /** fx's reasoning config option, when it reports one, for turn-time forwarding. */
+  reasoningConfig?: FxReasoningConfig;
   instructions?: string;
   sentInstructionFingerprint?: string;
   activeTurn?: FxTurn;
   releasing: boolean;
   lastRecoveryState?: string;
+  lastRecoveryMessage?: string;
+  lastRecoveryCause?: string;
 }
 
 export interface FxBridgeDependencies {
@@ -112,38 +124,237 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function parseJsonOutput(stdout: string, command: string): Record<string, unknown> {
+  try {
+    return asRecord(JSON.parse(stdout)) ?? {};
+  } catch {
+    throw new Error(`fx ${command} returned invalid JSON output`);
+  }
+}
+
 function statusValue(value: unknown): string {
   return typeof value === "string" ? value : "pending";
 }
 
-function formatModelName(id: string): string {
-  if (id === DEFAULT_FX_MODEL) return "GLM 5.2";
-  const model = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
-  return model
+/**
+ * Vendor labels for the `vendor/model` ids fx reports. fx exposes well over a
+ * hundred models, so the picker keeps the vendor: the bare model segment is
+ * ambiguous ("nova-pro", "command-a") once the slug is dropped. Unknown
+ * vendors fall back to title case rather than a guessed brand spelling.
+ */
+const FX_VENDOR_LABELS = new Map<string, string>([
+  ["alibaba", "Alibaba"],
+  ["amazon", "Amazon"],
+  ["anthropic", "Anthropic"],
+  ["bytedance", "ByteDance"],
+  ["cohere", "Cohere"],
+  ["deepseek", "DeepSeek"],
+  ["google", "Google"],
+  ["meta", "Meta"],
+  ["minimax", "MiniMax"],
+  ["mistral", "Mistral"],
+  ["moonshotai", "Moonshot AI"],
+  ["nvidia", "NVIDIA"],
+  ["openai", "OpenAI"],
+  ["perplexity", "Perplexity"],
+  ["tencent", "Tencent"],
+  ["zai", "Z.ai"],
+]);
+
+/** Slug segments that read as acronyms rather than words. */
+const FX_MODEL_ACRONYMS = new Set([
+  "glm",
+  "gpt",
+  "hy",
+  "kat",
+  "mt2",
+  "oss",
+  "vl",
+]);
+
+function titleCaseSlug(slug: string): string {
+  return slug
     .split(/[-_]/u)
     .filter(Boolean)
-    .map((part) => (/^(?:gpt|glm|qwen|kimi)$/iu.test(part) ? part.toUpperCase() : part))
+    .map((part) => {
+      const lower = part.toLowerCase();
+      if (FX_MODEL_ACRONYMS.has(lower)) return lower.toUpperCase();
+      if (/^[\d.]/u.test(part)) return part;
+      return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+    })
     .join(" ");
 }
 
-function availableModel(id: string, isDefault: boolean): AvailableModel {
+function formatModelName(id: string): string {
+  const separator = id.indexOf("/");
+  if (separator < 0) return titleCaseSlug(id);
+  const vendor = id.slice(0, separator);
+  const model = id.slice(separator + 1);
+  const vendorLabel = FX_VENDOR_LABELS.get(vendor) ?? titleCaseSlug(vendor);
+  return `${vendorLabel} ${titleCaseSlug(model)}`;
+}
+
+/**
+ * Reasoning support is derived from fx's own ACP config report rather than
+ * hardcoded. fx exposes the levels it understands as a config option in the
+ * `session/new` result, which this bridge reads and forwards back on turn
+ * start. When fx reports no reasoning config option (the case for fx 0.0.4,
+ * whose only config options are `model` and `mode`) no levels are advertised:
+ * BB renders a "Reasoning" section in the picker for any non-empty effort
+ * list, and it shows only the level label, so advertising a "medium" level
+ * would misrepresent a setting this bridge never applies. BB's schema still
+ * requires `defaultReasoningEffort` on every model, so "medium" is kept there
+ * (BB also sends `reasoningLevel` on turn start by default), but that value is
+ * ignored while fx reports no reasoning option.
+ */
+interface ReasoningSupport {
+  supportedReasoningEfforts: ModelReasoningEffort[];
+  defaultReasoningEffort: ReasoningLevel;
+}
+
+/** Map the value strings an ACP agent emits to BB reasoning levels. */
+const ACP_REASONING_LEVEL_BY_VALUE: Record<string, ReasoningLevel> = {
+  none: "none",
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  ultracode: "ultracode",
+  max: "max",
+  ultra: "ultra",
+};
+
+/** Candidate agent values to try for a chosen BB level, best fit first. */
+const ACP_REASONING_VALUE_CANDIDATES_BY_LEVEL: Record<
+  ReasoningLevel,
+  string[]
+> = {
+  none: ["none"],
+  low: ["low", "minimal"],
+  medium: ["medium"],
+  high: ["high"],
+  xhigh: ["xhigh"],
+  ultracode: ["ultracode", "xhigh"],
+  max: ["max", "xhigh"],
+  ultra: ["ultra"],
+};
+
+interface FxReasoningConfig {
+  id: string;
+  currentValue?: string;
+  values: Set<string>;
+  options: Array<{ value: string; name?: string }>;
+}
+
+function findFxReasoningConfig(configOptions: unknown): FxReasoningConfig | undefined {
+  const options = Array.isArray(configOptions) ? configOptions : [];
+  for (const entry of options) {
+    const option = asRecord(entry);
+    if (!option) continue;
+    // The ACP convention for the reasoning option is `category: "thought_level"`.
+    // Accept the common `reasoning_effort` config id as well; a declared option
+    // is authoritative even when this bridge cannot map its values.
+    if (
+      stringValue(option.category) !== "thought_level" &&
+      stringValue(option.id) !== "reasoning_effort" &&
+      stringValue(option.id) !== "reasoning"
+    ) {
+      continue;
+    }
+    const id = stringValue(option.id);
+    if (!id) continue;
+    const valueOptions = Array.isArray(option.options) ? option.options : [];
+    const normalized: FxReasoningConfig["options"] = [];
+    const values = new Set<string>();
+    for (const valueEntry of valueOptions) {
+      const valueRecord = asRecord(valueEntry);
+      const value = stringValue(valueRecord?.value);
+      if (value === undefined) continue;
+      values.add(value);
+      normalized.push({
+        value,
+        ...(stringValue(valueRecord?.name) === undefined
+          ? {}
+          : { name: stringValue(valueRecord?.name) }),
+      });
+    }
+    return {
+      id,
+      currentValue: stringValue(option.currentValue),
+      values,
+      options: normalized,
+    };
+  }
+  return undefined;
+}
+
+function buildFxReasoningSupport(
+  configOptions: unknown,
+): ReasoningSupport {
+  const reasoningConfig = findFxReasoningConfig(configOptions);
+  if (!reasoningConfig) {
+    // No reasoning option reported: advertise no levels so BB shows no
+    // reasoning control. `defaultReasoningEffort` is schema-required.
+    return {
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: "medium",
+    };
+  }
+  const supportedReasoningEfforts: ModelReasoningEffort[] = [];
+  const seen = new Set<ReasoningLevel>();
+  for (const option of reasoningConfig.options) {
+    const level = ACP_REASONING_LEVEL_BY_VALUE[option.value];
+    if (level === undefined || seen.has(level)) continue;
+    seen.add(level);
+    supportedReasoningEfforts.push({
+      reasoningEffort: level,
+      description: option.name ?? option.value,
+    });
+  }
+  if (supportedReasoningEfforts.length === 0) {
+    // A declared option is authoritative: advertise nothing rather than a
+    // fabricated level the agent does not actually understand.
+    return { supportedReasoningEfforts: [], defaultReasoningEffort: "medium" };
+  }
+  supportedReasoningEfforts.sort(
+    (a, b) =>
+      reasoningLevelValues.indexOf(a.reasoningEffort) -
+      reasoningLevelValues.indexOf(b.reasoningEffort),
+  );
+  const currentLevel =
+    reasoningConfig.currentValue === undefined
+      ? undefined
+      : ACP_REASONING_LEVEL_BY_VALUE[reasoningConfig.currentValue];
+  const levels = supportedReasoningEfforts.map((effort) => effort.reasoningEffort);
+  return {
+    supportedReasoningEfforts,
+    defaultReasoningEffort:
+      currentLevel !== undefined && levels.includes(currentLevel)
+        ? currentLevel
+        : supportedReasoningEfforts[0].reasoningEffort,
+  };
+}
+
+function availableModel(
+  id: string,
+  isDefault: boolean,
+  reasoning: ReasoningSupport,
+): AvailableModel {
   return {
     id,
     model: id,
     displayName: formatModelName(id),
-    description: `Available through FX (${id}).`,
-    supportedReasoningEfforts: [
-      {
-        reasoningEffort: "medium",
-        description: "Reasoning is managed by FX and the selected model.",
-      },
-    ],
-    defaultReasoningEffort: "medium",
+    description: `Available through fx (${id}).`,
+    ...reasoning,
     isDefault,
   };
 }
 
-export async function loadFxModels(cwd?: string): Promise<ModelCatalogResult> {
+export async function loadFxModels(
+  cwd?: string,
+  reasoning: ReasoningSupport = buildFxReasoningSupport(undefined),
+): Promise<ModelCatalogResult> {
   const commandOptions = {
     cwd,
     env: withoutBridgeRuntimeEnv(process.env),
@@ -154,7 +365,7 @@ export async function loadFxModels(cwd?: string): Promise<ModelCatalogResult> {
     execFileAsync("fx", ["models", "--json"], commandOptions),
     execFileAsync("fx", ["status", "--json"], commandOptions).catch(() => null),
   ]);
-  const modelsPayload = asRecord(JSON.parse(modelsResult.stdout));
+  const modelsPayload = parseJsonOutput(modelsResult.stdout, "models --json");
   const ids = Array.isArray(modelsPayload?.ids)
     ? modelsPayload.ids.filter((id): id is string => typeof id === "string")
     : [];
@@ -162,17 +373,25 @@ export async function loadFxModels(cwd?: string): Promise<ModelCatalogResult> {
     throw new Error("fx models returned no available models");
   }
   const statusPayload = statusResult
-    ? asRecord(JSON.parse(statusResult.stdout))
+    ? parseJsonOutput(statusResult.stdout, "status --json")
     : undefined;
   const configuredDefault = stringValue(statusPayload?.model);
+  // `fx status` can report a model that `fx models` omits (the account default
+  // is not always in the public catalog), but fx's ACP session still accepts
+  // it. Keep it selectable instead of silently falling back to a stranger.
+  const catalogIds =
+    configuredDefault && !ids.includes(configuredDefault)
+      ? [configuredDefault, ...ids]
+      : ids;
   const defaultId =
-    (configuredDefault && ids.includes(configuredDefault) && configuredDefault) ||
-    (ids.includes(DEFAULT_FX_MODEL) ? DEFAULT_FX_MODEL : ids[0]);
-  const models = ids.map((id) => availableModel(id, id === defaultId));
-  const primary = models.find((model) => model.isDefault) ?? models[0];
+    (configuredDefault && catalogIds.includes(configuredDefault) && configuredDefault) ||
+    (catalogIds.includes(DEFAULT_FX_MODEL) ? DEFAULT_FX_MODEL : catalogIds[0]);
+  // Every fx model is user-selectable, so the whole catalog belongs in
+  // `models`. `selectedOnlyModels` is BB's hidden bucket for entries that must
+  // resolve when already selected but must not be offered in the picker.
   return {
-    models: [primary],
-    selectedOnlyModels: models.filter((model) => model.id !== primary.id),
+    models: catalogIds.map((id) => availableModel(id, id === defaultId, reasoning)),
+    selectedOnlyModels: [],
   };
 }
 
@@ -227,6 +446,8 @@ function requestSchema(method: string): z.ZodType | undefined {
       return threadResumeParamsSchema;
     case "thread/stop":
       return threadStopParamsSchema;
+    case "thread/discard":
+      return threadDiscardParamsSchema;
     case "turn/start":
       return turnStartParamsSchema;
     case "turn/steer":
@@ -245,6 +466,10 @@ export function createFxProviderBridge(
   const loadModels = dependencies.loadModels ?? loadFxModels;
   const sessionsByThreadId = new Map<string, FxSession>();
   const sessionsByProviderThreadId = new Map<string, FxSession>();
+  const recoverableSessions = new Map<
+    string,
+    { providerThreadId: string; cwd: string }
+  >();
   let skillRoots: SkillsConfigureParams["roots"] = [];
   let initialized = false;
 
@@ -311,6 +536,7 @@ export function createFxProviderBridge(
     turn: FxTurn,
     status: "completed" | "failed" | "interrupted",
     message?: string,
+    category: ProviderErrorCategory = "unknown",
   ): void {
     if (turn.settled || session.releasing) return;
     turn.settled = true;
@@ -320,7 +546,7 @@ export function createFxProviderBridge(
         session,
         turn,
         tool,
-        status === "interrupted" ? "interrupted" : "failed",
+        status === "failed" ? "failed" : "interrupted",
       );
     }
     if (status === "failed" && message) {
@@ -330,7 +556,7 @@ export function createFxProviderBridge(
         providerThreadId: session.providerThreadId,
         message,
         errorInfo: {
-          category: "unknown",
+          category,
           httpStatusCode: null,
           providerCode: null,
         },
@@ -387,7 +613,7 @@ export function createFxProviderBridge(
     if (existing) return;
     const tool: FxToolItem = {
       id: `fx-tool-${randomUUID()}`,
-      title: stringValue(update.title) ?? "FX tool",
+      title: stringValue(update.title) ?? "fx tool",
       kind: stringValue(update.kind) ?? "other",
       completed: false,
     };
@@ -403,6 +629,17 @@ export function createFxProviderBridge(
         status: "pending",
       },
     });
+    emitToolProgress(session, tool);
+  }
+
+  /**
+   * fx re-sends `tool_call_update` for each chunk of a running tool, and its
+   * title rarely changes. Emitting every one would stack identical progress
+   * lines in the timeline, so only a changed message is forwarded.
+   */
+  function emitToolProgress(session: FxSession, tool: FxToolItem): void {
+    if (tool.lastProgress === tool.title) return;
+    tool.lastProgress = tool.title;
     emit(session, {
       type: "item/toolCall/progress",
       threadId: session.threadId,
@@ -435,52 +672,70 @@ export function createFxProviderBridge(
     if (!tool) {
       handleToolCall(session, {
         toolCallId: callId,
-        title: "FX tool",
+        title: "fx tool",
         kind: "other",
       });
       tool = turn.tools.get(callId);
     }
     if (!tool || tool.completed) return;
     tool.result = extractToolResult(update) ?? tool.result;
+    tool.title = stringValue(update.title) ?? tool.title;
     const status = statusValue(update.status);
     if (status === "completed" || status === "failed") {
       completeTool(session, turn, tool, status);
       return;
     }
-    emit(session, {
-      type: "item/toolCall/progress",
-      threadId: session.threadId,
-      providerThreadId: session.providerThreadId,
-      itemId: tool.id,
-      message: tool.title,
-    });
+    emitToolProgress(session, tool);
+  }
+
+  /**
+   * fx nests its recovery payload as `_meta.fx.modelResponseRecovery`. Older
+   * builds used a flat `"fx.modelResponseRecovery"` key, so accept both rather
+   * than silently dropping every retry notice.
+   */
+  function readRecovery(
+    update: Record<string, unknown>,
+  ): Record<string, unknown> | undefined {
+    const meta = asRecord(update._meta);
+    if (!meta) return undefined;
+    return (
+      asRecord(asRecord(meta.fx)?.modelResponseRecovery) ??
+      asRecord(meta["fx.modelResponseRecovery"])
+    );
   }
 
   function handleRecoveryUpdate(
     session: FxSession,
     update: Record<string, unknown>,
   ): void {
-    const meta = asRecord(update._meta);
-    const recovery = asRecord(meta?.["fx.modelResponseRecovery"]);
+    const recovery = readRecovery(update);
     const state = stringValue(recovery?.state);
-    if (!state || state === session.lastRecoveryState) return;
-    session.lastRecoveryState = state;
+    if (!state) return;
     const message = stringValue(recovery?.message);
+    session.lastRecoveryMessage = message;
+    session.lastRecoveryCause = stringValue(recovery?.cause);
+    // fx repeats `active` for every retry attempt. Keep emitting those so a
+    // long backoff is visible, but never repeat a settled state.
+    if (state === session.lastRecoveryState && state !== "active") return;
+    session.lastRecoveryState = state;
     const attempt = recovery?.attempt;
     const attemptLimit = recovery?.attemptLimit;
     const attemptText =
       typeof attempt === "number" && typeof attemptLimit === "number"
         ? ` (attempt ${attempt}/${attemptLimit})`
         : "";
+    const summary =
+      state === "recovered"
+        ? "fx model response recovered"
+        : state === "paused"
+          ? `fx paused after failing to reach the model${attemptText}`
+          : `fx is recovering the model response${attemptText}`;
     emit(session, {
       type: "provider/warning",
       threadId: session.threadId,
       providerThreadId: session.providerThreadId,
       category: "general",
-      summary:
-        state === "recovered"
-          ? "FX model response recovered"
-          : `FX is recovering the model response${attemptText}`,
+      summary,
       ...(message ? { details: message } : {}),
     });
   }
@@ -517,18 +772,53 @@ export function createFxProviderBridge(
 
   function handleAcpRequest(request: JsonRpcRequest): unknown {
     if (request.method === "session/request_permission") {
-      return { outcome: { outcome: "selected", optionId: "reject_once" } };
+      // BB advertises exactly one permission mode, `auto`, and tells the
+      // runtime that approvals are `approvalEnforcedBy: "provider"` — so the
+      // bridge *is* the automatic reviewer, and there is no BB surface that
+      // could put this prompt in front of a person. Declining instead would
+      // deny every file mutation and every shell command, which is the whole
+      // agent. Prefer the single-use option so nothing is granted for longer
+      // than the call that asked for it.
+      const params = asRecord(request.params);
+      const options = Array.isArray(params?.options) ? params.options : [];
+      const kinds = options.map((option) => asRecord(option));
+      const allowOption =
+        kinds.find((option) => stringValue(option?.kind) === "allow_once") ??
+        kinds.find((option) => stringValue(option?.kind)?.startsWith("allow"));
+      const optionId = stringValue(allowOption?.optionId);
+      if (optionId) {
+        return { outcome: { outcome: "selected", optionId } };
+      }
+      // No allow option offered: cancelling leaves fx to report the blocked
+      // action in the transcript rather than inventing an outcome.
+      return { outcome: { outcome: "cancelled" } };
     }
     if (request.method === "elicitation/create") {
       return { action: "cancel" };
     }
-    throw new Error(`Unsupported FX ACP client request: ${request.method}`);
+    throw new Error(`Unsupported fx ACP client request: ${request.method}`);
   }
 
   function handleAcpExit(session: FxSession, error: Error): void {
     if (session.releasing) return;
+    recoverableSessions.set(session.threadId, {
+      providerThreadId: session.providerThreadId,
+      cwd: session.cwd,
+    });
     const turn = session.activeTurn;
     if (turn) finishTurn(session, turn, "failed", error.message);
+    emit(
+      session,
+      {
+        type: "provider/warning",
+        threadId: session.threadId,
+        providerThreadId: session.providerThreadId,
+        category: "general",
+        summary: "The fx process exited unexpectedly.",
+        ...(error.message ? { details: error.message } : {}),
+      },
+      threadScope(),
+    );
     sessionsByThreadId.delete(session.threadId);
     sessionsByProviderThreadId.delete(session.providerThreadId);
   }
@@ -539,17 +829,52 @@ export function createFxProviderBridge(
   ): Promise<void> {
     const requestedModel = options.model;
     if (requestedModel && requestedModel !== session.model) {
-      await session.connection.request("session/set_config_option", {
-        sessionId: session.providerThreadId,
-        configId: "model",
-        value: requestedModel,
-      });
+      try {
+        await session.connection.request("session/set_config_option", {
+          sessionId: session.providerThreadId,
+          configId: "model",
+          value: requestedModel,
+        });
+      } catch (error) {
+        // Fail loudly: silently running a turn on a different model than the
+        // one the picker shows is worse than refusing the turn.
+        throw new Error(
+          `fx rejected the model "${requestedModel}": ${errorMessage(error)}`,
+        );
+      }
       session.model = requestedModel;
     }
-    await session.connection.request("session/set_mode", {
-      sessionId: session.providerThreadId,
-      modeId: "code",
-    });
+    // Forward the user's chosen reasoning level only when fx actually reports a
+    // reasoning config option. fx (0.0.4) exposes none — it manages reasoning
+    // per model — and the catalog advertises no levels in that case, so this
+    // is a no-op there.
+    const requestedReasoning = options.reasoningLevel;
+    const reasoningConfig = session.reasoningConfig;
+    if (requestedReasoning && reasoningConfig && reasoningConfig.values.size > 0) {
+      const value = (ACP_REASONING_VALUE_CANDIDATES_BY_LEVEL[requestedReasoning] ?? []).find(
+        (candidate) => reasoningConfig.values.has(candidate),
+      );
+      if (value !== undefined) {
+        try {
+          await session.connection.request("session/set_config_option", {
+            sessionId: session.providerThreadId,
+            configId: reasoningConfig.id,
+            value,
+          });
+        } catch (error) {
+          throw new Error(
+            `fx rejected reasoning level "${requestedReasoning}": ${errorMessage(error)}`,
+          );
+        }
+      }
+    }
+    // Deliberately no `session/set_mode`. fx's "code" mode hands tool approval
+    // to fx's own auto-mode classifier, which has no way to escalate over ACP:
+    // it denies `terminal.exec` outright ("Permission denied by auto mode
+    // classifier") and tells the model to fall back to `ask_user_question`,
+    // which fx only offers in its interactive shell. Leaving the session in its
+    // default "ask" mode is what routes approvals through
+    // `session/request_permission`, where this bridge answers them.
     session.instructions = options.instructions;
   }
 
@@ -570,6 +895,12 @@ export function createFxProviderBridge(
       ...withoutBridgeRuntimeEnv(process.env),
       ...buildShellEnvOverrides(params.options.envVars),
       NO_COLOR: "1",
+      // Pin the permission mode rather than inheriting whatever `fx
+      // permissions` last persisted. `ask` is the only mode that routes tool
+      // approval through ACP `session/request_permission`; under `auto` fx's
+      // classifier denies non-interactively, and `yolo` would skip fx's own
+      // sandboxing. See the note in configureSession.
+      FX_PERMISSION_MODE: "ask",
     };
     const connection = await createConnection({
       cwd: params.cwd,
@@ -586,7 +917,7 @@ export function createFxProviderBridge(
     try {
       await connection.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "bb-plugin-fx", version: "0.1.0" },
+        clientInfo: { name: "bb-plugin-fx", version: "0.2.0" },
       });
       const result = asRecord(
         await connection.request(
@@ -613,12 +944,17 @@ export function createFxProviderBridge(
         providerThreadId,
         connection,
         cwd: params.cwd,
+        reasoningConfig: findFxReasoningConfig(result?.configOptions),
         releasing: false,
       };
       sessionRef = session;
       await configureSession(session, params.options);
       sessionsByThreadId.set(session.threadId, session);
       sessionsByProviderThreadId.set(session.providerThreadId, session);
+      recoverableSessions.set(session.threadId, {
+        providerThreadId: session.providerThreadId,
+        cwd: session.cwd,
+      });
       return session;
     } catch (error) {
       await connection.close();
@@ -648,9 +984,39 @@ export function createFxProviderBridge(
     return `<bb_instructions>\n${fingerprint}\n</bb_instructions>\n\n`;
   }
 
+  const RECOVERY_CAUSE_CATEGORIES: Record<string, ProviderErrorCategory> = {
+    provider_unavailable: "overloaded",
+    rate_limited: "rate-limit",
+    context_length_exceeded: "context-window-exceeded",
+    unauthorized: "unauthorized",
+  };
+
+  function describeRefusal(session: FxSession): {
+    message: string;
+    category: ProviderErrorCategory;
+  } {
+    const cause = session.lastRecoveryCause;
+    const category: ProviderErrorCategory =
+      (cause === undefined ? undefined : RECOVERY_CAUSE_CATEGORIES[cause]) ??
+      "unknown";
+    if (session.lastRecoveryState === "paused" && session.lastRecoveryMessage) {
+      return { message: `fx could not complete the turn: ${session.lastRecoveryMessage}`, category };
+    }
+    return {
+      message:
+        "fx ended the turn without a response. Check the thread for fx's own error output.",
+      category,
+    };
+  }
+
   async function runTurn(session: FxSession, params: TurnStartParams): Promise<void> {
     const turn = createTurn(params.clientRequestId);
     session.activeTurn = turn;
+    // Recovery state is per-turn: a fresh prompt must be able to re-report the
+    // same state the previous turn ended on.
+    session.lastRecoveryState = undefined;
+    session.lastRecoveryMessage = undefined;
+    session.lastRecoveryCause = undefined;
     emit(session, {
       type: "turn/input/accepted",
       threadId: session.threadId,
@@ -687,16 +1053,33 @@ export function createFxProviderBridge(
           finishTurn(session, turn, "interrupted");
           break;
         case "max_output_tokens":
-          finishTurn(session, turn, "failed", "FX reached the model output limit");
+          finishTurn(
+            session,
+            turn,
+            "failed",
+            "fx reached the model output limit",
+            "max-output-tokens",
+          );
           break;
         case "max_model_turns":
-          finishTurn(session, turn, "failed", "FX reached its model turn limit");
+          finishTurn(
+            session,
+            turn,
+            "failed",
+            "fx reached its model turn limit",
+            "max-turns",
+          );
           break;
-        case "refused":
-          finishTurn(session, turn, "failed", "The FX model refused the request");
+        case "refused": {
+          // fx returns `refused` for any terminal turn failure, not just a
+          // model refusal — an exhausted 503 retry loop and a billing rejection
+          // both land here. Prefer the recovery detail it already reported.
+          const { message, category } = describeRefusal(session);
+          finishTurn(session, turn, "failed", message, category);
           break;
+        }
         default:
-          finishTurn(session, turn, "failed", `FX stopped: ${stopReason}`);
+          finishTurn(session, turn, "failed", `fx stopped: ${stopReason}`);
       }
     } catch (error) {
       if (!session.releasing) {
@@ -707,6 +1090,7 @@ export function createFxProviderBridge(
 
   async function releaseSession(session: FxSession): Promise<void> {
     session.releasing = true;
+    recoverableSessions.delete(session.threadId);
     sessionsByThreadId.delete(session.threadId);
     sessionsByProviderThreadId.delete(session.providerThreadId);
     try {
@@ -742,7 +1126,7 @@ export function createFxProviderBridge(
       ),
     ]);
     if (!settled && !turn.settled) {
-      finishTurn(session, turn, "interrupted", "FX cancellation timed out");
+      finishTurn(session, turn, "interrupted", "fx cancellation timed out");
     }
   }
 
@@ -811,13 +1195,28 @@ export function createFxProviderBridge(
       }
       case "turn/start": {
         const params = request.params as TurnStartParams;
-        const session = sessionsByThreadId.get(params.threadId);
+        let session = sessionsByThreadId.get(params.threadId);
         if (!session || session.providerThreadId !== params.providerThreadId) {
-          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.SESSION_NOT_RESTORABLE, "No active FX session");
+          const recoverable = recoverableSessions.get(params.threadId);
+          if (recoverable?.providerThreadId === params.providerThreadId) {
+            session = await createSession(
+              "resume",
+              {
+                threadId: params.threadId,
+                cwd: recoverable.cwd,
+                instructionMode: "append",
+                options: params.options,
+                providerThreadId: params.providerThreadId,
+              } as ThreadResumeParams,
+            );
+          }
+        }
+        if (!session) {
+          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.SESSION_NOT_RESTORABLE, "No active fx session");
           return;
         }
         if (session.activeTurn) {
-          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR, "An FX turn is already active");
+          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR, "An fx turn is already active");
           return;
         }
         void runTurn(session, params);
@@ -828,13 +1227,13 @@ export function createFxProviderBridge(
         const params = request.params as TurnSteerParams;
         const session = sessionsByThreadId.get(params.threadId);
         if (!session?.activeTurn) {
-          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN, "No active FX turn to steer");
+          sendError(request.id, BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN, "No active fx turn to steer");
           return;
         }
         sendError(
           request.id,
           BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
-          "FX ACP does not support steering an active prompt; interrupt and send a new turn",
+          "fx ACP does not support steering an active prompt; interrupt and send a new turn",
         );
         return;
       }
@@ -847,6 +1246,18 @@ export function createFxProviderBridge(
           if (params.intent === "release") await releaseSession(session);
           else await interruptSession(session);
         }
+        sendResult(request.id, { ok: true });
+        return;
+      }
+      case "thread/discard": {
+        // BB sends discard for every deleted thread, ungated by capability.
+        // Without it the fx subprocess for that thread would outlive it.
+        const params = request.params as ThreadDiscardParams;
+        const session =
+          sessionsByThreadId.get(params.threadId) ??
+          sessionsByProviderThreadId.get(params.providerThreadId);
+        recoverableSessions.delete(params.threadId);
+        if (session) await releaseSession(session);
         sendResult(request.id, { ok: true });
         return;
       }
