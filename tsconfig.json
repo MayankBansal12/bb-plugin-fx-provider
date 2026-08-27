@@ -20,7 +20,6 @@
     "host.ts",
     "app.tsx",
     "vitest.config.ts",
-    "src/**/*.ts",
     "tests/**/*.ts"
   ]
 }

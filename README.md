@@ -4,18 +4,16 @@ Run [fx](https://fx.sh/) as an agent provider inside BB.
 
 <img width="600" height="380" alt="image" src="https://github.com/user-attachments/assets/f9eefc64-6604-4ad1-acf9-1be071d2712f" />
 
-
-The plugin uses fx's Agent Client Protocol (`fx acp`) over stdio and translates
-its sessions, streamed assistant text, tool calls, cancellation, and model
-recovery updates into BB's provider bridge protocol. Each BB thread owns an
-isolated fx subprocess. fx keeps its own durable session so a BB thread can be
-resumed after the provider bridge restarts. If the fx process exits between
-turns, the bridge warns in the thread and transparently resumes the durable fx
-session on the next message.
+fx speaks the [Agent Client Protocol](https://agentclientprotocol.com), and BB
+ships a first-party ACP bridge for exactly that case. So this plugin is a
+declaration, not a protocol implementation: `server.ts` registers the provider
+and says how to launch fx (`fx acp`), and `host.ts` re-exports BB's shared ACP
+bridge, which owns the session, streaming, tool calls, permissions, and model
+selection.
 
 ## Requirements
 
-- BB 0.39 or newer
+- BB 0.40 or newer (`bb.providers.register`, plugin SDK 0.4.21)
 - fx available as `fx` on the host `PATH`
 - An authenticated fx CLI (`fx login`)
 
@@ -23,15 +21,12 @@ Verify fx before installing:
 
 ```sh
 fx status --json
-fx models --json
 ```
 
 ## Install
 
-Install release v0.2.1 straight from GitHub:
-
 ```sh
-bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@v0.2.1 --yes
+bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@v0.3.0 --yes
 ```
 
 For local development:
@@ -48,44 +43,41 @@ Reload after local changes:
 bb plugin reload fx
 ```
 
-The provider appears as **fx** in BB, using fx's own wordmark.
+The provider appears as **fx** in BB, using fx's own wordmark, grouped with
+BB's other ACP agents.
 
 ### Models
 
-The picker lists every model `fx models --json` reports. `fx status --json`
-names the account default, and the bridge keeps that model selectable even when
-`fx models` omits it — on fx 0.0.4 the account default (`zai/glm-5.2`) is not in
-the 156-id public catalog, but the ACP session accepts it. BB sends the selected
-model to fx through ACP's `session/set_config_option` before a turn; a model fx
-rejects fails the turn rather than silently running on a different one.
+The launch spec deliberately declares no `modelCli`. `fx models --json` omits
+models the account can still select — on fx 0.0.4 the account default
+(`zai/glm-5.2`) is missing from that 156-id catalog — while ACP `session/new`
+returns all 157 as a `model` config option, with the account default as the
+current value. Leaving the model CLI out makes the shared bridge read the
+catalog from the agent itself, which is the complete and correct list. BB
+applies the selected model through `session/set_config_option` before a turn.
 
 ## Deliberate scope
 
-- The fx subprocess runs with `FX_PERMISSION_MODE=ask`, and the session is left
-  in fx's default `ask` mode, so tool approval arrives over ACP
-  `session/request_permission`. The bridge is the automatic reviewer BB
-  advertises (`permissionModes: ["auto"]`, `approvalEnforcedBy: "provider"`) and
-  automatically answers with fx's single-use allow option; BB does not show an
-  interactive approval prompt for these requests. fx's `code` mode is
-  deliberately not selected: its classifier denies `terminal.exec`
-  non-interactively and redirects the model to an ask-user-question tool fx
-  only offers in its own shell.
+- **Permissions are BB's.** The shared ACP bridge answers fx's
+  `session/request_permission` from BB's own permission mode
+  (`approvalEnforcedBy: "runtime"`), so tool approval follows the same rules
+  and surfaces as every other ACP agent in BB. The declaration advertises
+  `accept-edits` and `full`.
 - `supportsNativeUserQuestion` is `false`. fx's native prompt is ACP
-  `elicitation/create`, which this bridge declines because it has no BB surface
-  to render it; claiming otherwise would suppress BB's own fallback.
-- fx models advertise no supported reasoning levels. fx exposes no reasoning
-  config option over ACP (`session/new` reports only `model` and `mode` on fx
-  0.0.4), so BB shows no reasoning control and the bridge forwards no reasoning
-  value. The provider declaration retains BB's required static `medium`
-  fallback, but it is not applied to fx. If a future fx build reports a
-  `thought_level` config option, the bridge surfaces and forwards those levels
-  automatically.
-- Forking, provider-side archive/rename, manual compaction, service tiers, and
-  BB workflows are not advertised.
-- fx's built-in retry loop is allowed to run without a bridge timeout. Recovery
-  updates, including transient model 503s, appear as non-terminal BB warnings.
-- fx ACP currently accepts text and embedded context, not image/audio input;
-  attached file and image paths are passed as text for fx to inspect locally.
+  `elicitation/create`, which the shared bridge does not surface in BB;
+  claiming otherwise would suppress BB's own fallback.
+- No reasoning control. fx 0.0.4 exposes no reasoning configuration — neither a
+  CLI flag nor a `session/new` config option (it reports only `model` and
+  `mode`) — so the launch spec declares no `reasoningCli` or `nativeReasoning`
+  and nothing forwards a reasoning value. The declaration keeps BB's required
+  static `medium` fallback ladder, unused.
+- `fork: "none"`. `fx acp` advertises `sessionCapabilities: { list, resume,
+  close }` and no `session/fork`.
+- Provider-side archive/rename, manual compaction, and service tiers are not
+  advertised.
+- Model discovery is `scope: "host"`: fx answers from the signed-in account,
+  not from anything in the workspace, so one probe per machine serves every
+  environment on it.
 
 ## Development
 
@@ -95,12 +87,12 @@ npm test
 npm run build
 ```
 
-`npm test` covers protocol negotiation, invalid requests, model catalog
-assembly, identity ordering, session start/resume, streamed text, tool
-lifecycle, permission answers, recovery events, cancellation, discard, and
-release semantics. `npm run build` produces the server, app, and host artifacts
-under `dist/` for managed BB installs.
+`npm test` loads the plugin into the SDK's fake plugin host, so the provider
+declaration is validated by the same code the real server runs — a field the
+current contract does not accept fails the test rather than the install.
+`npm run build` produces the server, app, and host artifacts under `dist/` for
+managed BB installs.
 
-Fixtures in `tests/` mirror payloads captured from a live `fx acp` 0.0.4
-session — notably the `_meta.fx.modelResponseRecovery` shape. Re-capture them
-against a real session rather than hand-writing new shapes.
+There are no bridge protocol tests any more, because there is no bridge in this
+repository: BB's `@get-bb/plugin-sdk/provider-bridge/acp` owns that behavior and
+tests it upstream.
