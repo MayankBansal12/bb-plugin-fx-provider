@@ -33,13 +33,14 @@
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check:managed": "node scripts/check-managed-build.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run check:managed"
   },
   "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.21",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.21",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
