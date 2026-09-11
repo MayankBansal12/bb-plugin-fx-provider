@@ -105,3 +105,8 @@ devDependencies does not apply to provider bridges.
 0.3.0, validate this branch, merge it, and create a new immutable `v0.3.0` tag.
 A later marketplace update must point at that release and include the overview
 and required category. The older `^0.2.1` range does not include 0.3.0.
+
+The marketplace icon source is `assets/fx-marketplace.svg`. It has a transparent
+background so BB can tint it as an SVG mask. Vendor it into the marketplace
+under a filename containing the first eight characters of its SHA-256 hash;
+do not add an opaque background to the SVG.
