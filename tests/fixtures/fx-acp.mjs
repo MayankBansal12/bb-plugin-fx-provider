@@ -7,10 +7,27 @@ import { createInterface } from "node:readline";
 
 let sessionId;
 let model = "account-default";
+let effort = "auto";
+const nativeReasoning = process.env.FX_FIXTURE_REASONING === "1";
 const pending = new Map();
 const send = (message) =>
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 const configOptions = () => [
+  ...(nativeReasoning && model === "alternate"
+    ? [
+        {
+          id: "effort",
+          name: "Reasoning Effort",
+          category: "thought_level",
+          type: "select",
+          currentValue: effort,
+          options: ["auto", "low", "medium", "high"].map((value) => ({
+            value,
+            name: value,
+          })),
+        },
+      ]
+    : []),
   {
     // Real fx 0.0.7 returns this before the actual model, with the same category.
     id: "provider",
@@ -86,9 +103,18 @@ async function handle(message) {
       reply({ sessionId, configOptions: configOptions() });
       break;
     case "session/set_config_option":
-      if (message.params.configId !== "model")
-        throw new Error("Only model selection should be forwarded");
-      model = message.params.value;
+      if (message.params.configId === "model") {
+        model = message.params.value;
+      } else if (
+        nativeReasoning &&
+        model === "alternate" &&
+        message.params.configId === "effort" &&
+        ["auto", "low", "medium", "high"].includes(message.params.value)
+      ) {
+        effort = message.params.value;
+      } else {
+        throw new Error("Unsupported config option must not be forwarded");
+      }
       reply({ configOptions: configOptions() });
       break;
     case "session/prompt": {
@@ -128,7 +154,7 @@ async function handle(message) {
         );
       } else if (!text.includes("/noop")) {
         update(
-          `model:${model}; permission-mode:${process.env.FX_PERMISSION_MODE}`,
+          `model:${model}; effort:${effort}; permission-mode:${process.env.FX_PERMISSION_MODE}`,
         );
       }
       reply({ stopReason: "end_turn" });

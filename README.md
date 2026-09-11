@@ -57,7 +57,7 @@ still applies. This is not a filesystem sandbox: fx's own configured rules,
 session grants, and tool admission can decide a call before fx asks BB.
 
 The plugin does not set fx's `mode` session option. It passes model selection
-through the bridge and leaves reasoning configuration unspecified. The fx CLI
+and any advertised reasoning-effort choices through the bridge. The fx CLI
 owns credentials and service connections; the plugin stores no credentials of
 its own and adds no telemetry.
 
@@ -65,8 +65,17 @@ its own and adds no telemetry.
 
 The provider supports session restore but does not advertise forks, manual
 compaction, provider-side archive/rename, service tiers, or native user-question
-UI. It does not expose reasoning controls. The required static `medium`
-capability is a fallback declaration, not a reasoning setting sent to fx.
+UI. Reasoning controls appear only when the selected model exposes effort
+choices over ACP. Released fx 0.0.7 and 0.0.8 do not expose these; upstream
+[added model-specific ACP effort support](https://github.com/vercel-labs/fx/commit/32f3dc9ee07b9649ce10d6b24d1e30af0e20302a)
+after those releases. fx can still use its own saved effort preference.
+
+The required static `medium` capability is BB bookkeeping. Model discovery
+runs the shared bridge in a short-lived subprocess and removes its synthetic
+“agent-managed Medium” choice from the resulting catalog, including models
+left unprobed at the discovery deadline. Actual effort choices, including a
+real medium-only control, are preserved. When fx exposes no effort selector,
+the shared bridge sends no effort value and fx keeps its own preference.
 
 Registration uses the supported `bb.providers.register` API. The shared bridge
 export and static launch options still use the SDK's published experimental

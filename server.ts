@@ -76,8 +76,8 @@ export const fxProviderDeclaration: PluginProviderDeclaration = {
     supportsThreadArchive: false,
     supportsThreadRename: false,
     permissionModes: ["accept-edits", "full"],
-    // fx exposes no reasoning control, so this is BB's required static
-    // fallback ladder and nothing forwards it.
+    // Required static fallback only. The model catalog exposes effort choices
+    // only when fx advertises them; catalog normalization removes invented choices.
     reasoningLevels: ["medium"],
   },
   composerActions: [],

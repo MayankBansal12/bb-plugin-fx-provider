@@ -167,8 +167,15 @@ it("discovers the account default from ACP session configuration", async () => {
   const result = await bridge.request("model/list", { cwd, providerOptions });
   expect(result).toMatchObject({
     models: expect.arrayContaining([
-      expect.objectContaining({ id: "account-default", isDefault: true }),
-      expect.objectContaining({ id: "alternate" }),
+      expect.objectContaining({
+        id: "account-default",
+        isDefault: true,
+        supportedReasoningEfforts: [],
+      }),
+      expect.objectContaining({
+        id: "alternate",
+        supportedReasoningEfforts: [],
+      }),
     ]),
   });
 });
@@ -251,4 +258,76 @@ it("preserves fx refusals and settles the turn without a protocol error", async 
   const output = JSON.stringify(bridge.messages);
   expect(output).toContain("Fixture account rejection");
   expect(output).not.toContain('"kind":"provider.error"');
+});
+
+it.each([false, true])(
+  "only offers and forwards reasoning advertised by fx (native: %s)",
+  async (native) => {
+    const spec = providerOptions.acpLaunchSpec as Record<string, unknown>;
+    spec.env = {
+      ...(spec.env as object),
+      FX_FIXTURE_REASONING: native ? "1" : "0",
+    };
+    const catalog = await bridge.request("model/list", {
+      cwd,
+      providerOptions,
+    });
+    expect(catalog).toMatchObject({
+      models: expect.arrayContaining([
+        expect.objectContaining({
+          id: "account-default",
+          supportedReasoningEfforts: [],
+        }),
+        expect.objectContaining({
+          id: "alternate",
+          supportedReasoningEfforts: native
+            ? ["low", "medium", "high"].map((reasoningEffort) =>
+                expect.objectContaining({ reasoningEffort }),
+              )
+            : [],
+        }),
+      ]),
+    });
+    // A stored BB preference must not become an unsupported fx config request.
+    const configured = { ...options(), reasoningLevel: "high" };
+    const started = (await bridge.request("thread/start", {
+      threadId: "fx-reasoning",
+      cwd,
+      instructionMode: "append",
+      options: configured,
+    })) as { providerThreadId: string };
+    await bridge.request("turn/start", {
+      threadId: "fx-reasoning",
+      providerThreadId: started.providerThreadId,
+      clientRequestId: "creq_abcdefghjk",
+      options: configured,
+      input: [{ type: "text", text: "report settings", mentions: [] }],
+    });
+    await bridge.waitFor(
+      (message) =>
+        message.method === "thread/delta" &&
+        JSON.stringify(message.params).includes('"kind":"turn.boundary"'),
+    );
+    expect(JSON.stringify(bridge.messages)).toContain(
+      `model:alternate; effort:${native ? "high" : "auto"}`,
+    );
+    expect(JSON.stringify(bridge.messages)).not.toContain(
+      '"kind":"provider.error"',
+    );
+  },
+);
+
+it("preserves shared-bridge model request validation errors", async () => {
+  bridge.send(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: "bad-model-list",
+      method: "model/list",
+      params: { cwd: 42 },
+    }),
+  );
+  const response = await bridge.waitFor(
+    (message) => message.id === "bad-model-list",
+  );
+  expect(response.error).toMatchObject({ code: -32602 });
 });
