@@ -12,13 +12,15 @@ resumable sessions, and streamed replies and tool activity.
 - An authenticated fx account on that host: run `fx login`, then `fx status --json`.
 - Model access, limits, and service charges depend on your fx account and model provider.
 
-## Install this development version
+## Install
 
-Version 0.3.0 is in development and has no release tag yet. To review this branch:
+Install the latest compatible 0.3.x release:
 
 ```sh
-bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@chore/migrate-stable-provider-registration
+bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@^0.3.0
 ```
+
+Use `@v0.3.0` instead of `@^0.3.0` to pin the exact 0.3.0 release.
 
 For a local checkout:
 
@@ -110,10 +112,9 @@ managed Git installs omit development dependencies. `zod` is also needed by
 that bridge. The general `bb plugin types --check` advice to move the SDK to
 devDependencies does not apply to provider bridges.
 
-`PLUGIN_OVERVIEW.md` contains the marketplace description. Before publishing
-0.3.0, validate this branch, merge it, and create a new immutable `v0.3.0` tag.
-A later marketplace update must point at that release and include the overview
-and required category. The older `^0.2.1` range does not include 0.3.0.
+`PLUGIN_OVERVIEW.md` contains the marketplace description. Publish a new
+immutable `vX.Y.Z` tag for each validated release. Update the marketplace range
+when a release falls outside it, and keep its overview and category current.
 
 The marketplace icon source is `assets/fx-marketplace.svg`. It has a transparent
 background so BB can tint it as an SVG mask. Vendor it into the marketplace
