@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -85,7 +85,9 @@ function pluginFiles() {
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
     { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
   );
-  return listed.split("\0").filter(Boolean);
+  return listed
+    .split("\0")
+    .filter((file) => file && existsSync(join(repoRoot, file)));
 }
 
 /** The bb that would install this plugin: the pinned one when present. */
@@ -139,7 +141,7 @@ try {
     if (!probe.ok) {
       fail(
         `\`${specifier}\` does not resolve from a production-only install — ` +
-          "it is missing from `dependencies` in package.json (or from " +
+          "it is missing from `dependencies` in package.json (or in " +
           "package-lock.json)",
         probe.output,
       );
@@ -152,7 +154,7 @@ try {
   if (!build.ok) {
     fail("`bb plugin build` failed on a production-only install", build.output);
   }
-  for (const artifact of ["dist/server.js", "dist/host.js", "dist/app.js"]) {
+  for (const artifact of ["dist/server.js", "dist/host.js"]) {
     if (!existsSync(join(workdir, artifact))) {
       fail(`\`bb plugin build\` produced no ${artifact}`, build.output);
     }
@@ -160,15 +162,14 @@ try {
   }
 
   step("Import the built host artifact");
-  const hostUrl = pathToFileURL(join(workdir, "dist", "host.js")).href;
   const load = run(
     process.execPath,
     [
       "--input-type=module",
       "-e",
-      `const m = await import(${JSON.stringify(hostUrl)});
-       if (typeof m[${JSON.stringify(BRIDGE_EXPORT)}] === "undefined") {
-         throw new Error("dist/host.js exports " + JSON.stringify(Object.keys(m)));
+      `import { experimental_providerBridge as bridge } from "./dist/host.js";
+       if (bridge.experimental_apiVersion !== 1 || typeof bridge.handleLine !== "function") {
+         throw new Error("dist/host.js does not export a valid provider bridge");
        }`,
     ],
     { cwd: workdir },

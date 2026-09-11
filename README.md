@@ -1,142 +1,107 @@
 # bb-plugin-fx
 
-Run [fx](https://fx.sh/) as an agent provider inside BB.
+Run [fx](https://fx.sh/) as an agent provider inside BB, with model selection,
+resumable sessions, and streamed replies and tool activity.
 
-<img width="600" height="380" alt="image" src="https://github.com/user-attachments/assets/f9eefc64-6604-4ad1-acf9-1be071d2712f" />
-
-fx speaks the [Agent Client Protocol](https://agentclientprotocol.com), and BB
-ships a first-party ACP bridge for exactly that case. So this plugin is a
-declaration, not a protocol implementation: `server.ts` registers the provider
-and says how to launch fx (`fx acp`), and `host.ts` re-exports BB's shared ACP
-bridge, which owns the session, streaming, tool calls, permissions, and model
-selection.
+<img width="600" height="380" alt="fx provider in BB" src="https://github.com/user-attachments/assets/f9eefc64-6604-4ad1-acf9-1be071d2712f" />
 
 ## Requirements
 
-- BB 0.40 or newer (`bb.providers.register`, plugin SDK 0.4.21)
-- fx available as `fx` on the host `PATH`
-- An authenticated fx CLI (`fx login`)
+- BB 0.42.1 or newer (plugin SDK 0.4.47).
+- The fx CLI available as `fx` on each execution host's `PATH`.
+- An authenticated fx account on that host: run `fx login`, then `fx status --json`.
+- Model access, limits, and service charges depend on your fx account and model provider.
 
-Verify fx before installing:
+## Install this development version
+
+Version 0.3.0 is in development and has no release tag yet. To review this branch:
 
 ```sh
-fx status --json
+bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@chore/migrate-stable-provider-registration
 ```
 
-## Install
+For a local checkout:
 
 ```sh
-bb plugin install git:https://github.com/MayankBansal12/bb-plugin-fx-provider.git@v0.3.0 --yes
-```
-
-For local development:
-
-```sh
-npm install
+npm ci
 npm run check
 bb plugin install .
 ```
 
-Reload after local changes:
+After local changes, run `npm run build` and `bb plugin reload fx`.
+The provider appears as **fx** in BB, grouped with the other ACP agents.
+Its SVG mark follows the theme through BB's built-in provider icon rendering.
 
-```sh
-bb plugin reload fx
-```
+## How it works
 
-The provider appears as **fx** in BB, using fx's own wordmark, grouped with
-BB's other ACP agents.
+`server.ts` registers the provider through `bb.providers.register` and declares
+how to launch `fx acp`. `host.ts` uses the SDK's shared ACP bridge for sessions,
+streaming, and approvals. A small child-process adapter puts fx's actual `model` config option
+before its `provider` option: fx 0.0.7 marks both as category `model`, while the
+shared bridge selects the first. It preserves the options and their values in
+responses and updates. The adapter also translates fx's `refused` stop reason
+to ACP's `refusal`, retaining the agent's rejection text. The plugin ships no
+frontend bundle.
 
-### Models
+Models come from ACP session configuration. Earlier fx CLI versions omitted
+selectable account defaults from `fx models --json`, so the launch spec leaves
+out `modelCli` and lets the bridge query the agent. The bridge applies model
+selection through ACP. The catalog is cached per host.
 
-The launch spec deliberately declares no `modelCli`. `fx models --json` omits
-models the account can still select — on fx 0.0.6 the account default
-(`zai/glm-5.2`) is the one id missing from that 158-id catalog — while ACP
-`session/new` returns all 159 as a `model` config option, with the account
-default as the current value. Leaving the model CLI out makes the shared bridge read the
-catalog from the agent itself, which is the complete and correct list. BB
-applies the selected model through `session/set_config_option` before a turn.
+### Permissions
 
-## Deliberate scope
+The launch spec pins `FX_PERMISSION_MODE=ask`, overriding an inherited `auto`
+or `yolo` mode. The bridge sends fx's `session/request_permission` requests to
+BB in `accept-edits` mode and allows them in `full` mode. BB's escalation policy
+still applies. This is not a filesystem sandbox: fx's own configured rules,
+session grants, and tool admission can decide a call before fx asks BB.
 
-- **Permissions are BB's.** The launch spec pins `FX_PERMISSION_MODE=ask` on
-  the `fx acp` process, and the shared ACP bridge answers the
-  `session/request_permission` requests that mode produces from BB's own
-  permission mode (`approvalEnforcedBy: "runtime"`). Tool approval therefore
-  follows the same rules and surfaces as every other ACP agent in BB, and the
-  declaration advertises `accept-edits` and `full`. Left to its default,
-  `FX_PERMISSION_MODE=auto`, fx resolves sensitive tool calls *itself* — it
-  reviews each one and returns a failed tool result on a non-allow — so BB
-  would never be asked and those two modes would be cosmetic. fx's configured
-  rules, session grants, and tool admission still apply ahead of the ask. The
-  mode is pinned rather than inherited so a stray `FX_PERMISSION_MODE=yolo` in
-  the environment BB happens to run under cannot quietly disable fx's
-  permission policy for every thread on the machine.
-- `supportsNativeUserQuestion` is `false`. fx's native prompt is ACP
-  `elicitation/create`, which the shared bridge does not surface in BB;
-  claiming otherwise would suppress BB's own fallback.
-- No reasoning control. fx 0.0.6 exposes no reasoning configuration — neither a
-  CLI flag nor a `session/new` config option (it reports `provider`, `model`
-  and `mode`, and nothing resembling reasoning or effort) — so the launch spec
-  declares no `reasoningCli` or `nativeReasoning` and nothing forwards a
-  reasoning value. The declaration keeps BB's required
-  static `medium` fallback ladder, unused.
-- `fork: "none"`. `fx acp` advertises `sessionCapabilities: { list, resume,
-  close }` and no `session/fork`.
-- fx also exposes its permission mode as a `mode` session config option
-  (`code` → fx's `auto`, `ask` → `ask`), which the pinned environment seeds to
-  `ask`. Setting it back to `code` mid-session does stop the
-  `session/request_permission` requests, but BB's shared bridge only reads
-  config options in the `model` and `thought_level` categories, so nothing in
-  BB can flip it — the pin holds for every thread BB starts.
-- Provider-side archive/rename, manual compaction, and service tiers are not
-  advertised.
-- Model discovery is `scope: "host"`: fx answers from the signed-in account,
-  not from anything in the workspace, so one probe per machine serves every
-  environment on it.
+The plugin does not set fx's `mode` session option. It passes model selection
+through the bridge and leaves reasoning configuration unspecified. The fx CLI
+owns credentials and service connections; the plugin stores no credentials of
+its own and adds no telemetry.
 
-## Development
+### Supported scope
+
+The provider supports session restore but does not advertise forks, manual
+compaction, provider-side archive/rename, service tiers, or native user-question
+UI. It does not expose reasoning controls. The required static `medium`
+capability is a fallback declaration, not a reasoning setting sent to fx.
+
+Registration uses the supported `bb.providers.register` API. The shared bridge
+export and static launch options still use the SDK's published experimental
+names; the plugin does not use the removed `bb.agents.experimental_registerProvider`
+API or the removed `supportsWorkflows` capability.
+
+## Development and validation
 
 ```sh
 npm run typecheck
 npm test
-npm run build
 npm run check:managed
 ```
 
-`npm run check` runs all four.
+`npm run check` runs all three; `npm test` builds the artifacts first.
+GitHub Actions runs the same checks on pull requests and pushes to `main`.
 
-`npm test` loads the plugin into the SDK's fake plugin host, so the provider
-declaration is validated by the same code the real server runs — a field the
-current contract does not accept fails the test rather than the install. The
-launch spec is additionally parsed with the SDK's own
-`experimental_acpLaunchSpecSchema`, the strict schema the shared bridge reads
-it with, so the plugin is checked against the bridge's contract instead of a
-copy of it. The pinned launch environment is asserted explicitly: fx must be
-launched in `ask`, never in `auto` or `yolo`.
+- Registration tests load the plugin into the SDK's fake host and validate the
+  launch spec with the SDK's ACP schema.
+- Bridge tests launch the actual `dist/host.js` through the public production
+  bootstrap. A local ACP fixture exercises canonical conformance (including
+  restore and streaming), model discovery, and permission allow/deny/full
+  behavior, plus fx's refusal response. It also rejects any launch that loses `FX_PERMISSION_MODE=ask`.
+  These tests need no account and do not claim to test the real fx CLI.
+- `check:managed` builds a temporary copy with `npm install --omit=dev`, checks
+  its server/host artifacts, and imports the host export. This catches missing
+  production dependencies that a developer build would conceal.
 
-`npm run build` produces the server, app, and host artifacts under `dist/` for
-managed BB installs.
+Keep `@get-bb/plugin-sdk` in **dependencies**, pinned to the tested version.
+BB bundles its `provider-bridge/acp` subpath from the plugin's own installation;
+managed Git installs omit development dependencies. `zod` is also needed by
+that bridge. The general `bb plugin types --check` advice to move the SDK to
+devDependencies does not apply to provider bridges.
 
-`npm run check:managed` reproduces a managed install. BB clones a `git:` plugin
-and runs `npm install --omit=dev` before building it, so anything the build
-resolves has to be a **production** dependency — which is why
-`@get-bb/plugin-sdk` and `zod` are in `dependencies`. A developer checkout has
-`devDependencies` installed too, so `npm run build` passes there even when the
-managed install cannot resolve
-`@get-bb/plugin-sdk/provider-bridge/acp` and the provider fails to load. The
-check copies the working tree to a temp directory, installs with `--omit=dev`,
-resolves each specifier the build needs, runs `bb plugin build`, and imports
-the built `dist/host.js` to confirm it still exports the bridge. Moving either
-dependency back under `devDependencies` fails it.
-
-One consequence worth knowing: because npm installs peer dependencies by
-default, promoting the SDK also pulls its *optional* peers — `better-sqlite3`
-(native), `hono`, `cron-parser` — into the production install, which this
-plugin needs neither to build nor to run. A managed install is ~37 MB rather
-than the handful of kilobytes `zod` alone took. That is the price of the SDK
-being resolvable at build time; there is no per-package way to decline an
-optional peer, and the alternative is the install failing outright.
-
-There are no bridge protocol tests any more, because there is no bridge in this
-repository: BB's `@get-bb/plugin-sdk/provider-bridge/acp` owns that behavior and
-tests it upstream.
+`PLUGIN_OVERVIEW.md` contains the marketplace description. Before publishing
+0.3.0, validate this branch, merge it, and create a new immutable `v0.3.0` tag.
+A later marketplace update must point at that release and include the overview
+and required category. The older `^0.2.1` range does not include 0.3.0.

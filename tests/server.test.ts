@@ -1,12 +1,29 @@
+import { fileURLToPath } from "node:url";
 import { experimental_acpLaunchSpecSchema } from "@get-bb/plugin-sdk/provider-bridge/acp";
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import {
+  createFakePluginHost,
+  experimental_scanPublicSdkOnly,
+} from "@get-bb/plugin-sdk/testing";
+import { afterEach, describe, expect, it } from "vitest";
 import plugin, { fxProviderDeclaration } from "../server.js";
 
+const hosts: ReturnType<typeof createFakePluginHost>[] = [];
+afterEach(async () => {
+  await Promise.all(
+    hosts.splice(0).map(({ harness }) => harness.lifecycle.dispose()),
+  );
+});
+
+function createHost() {
+  const host = createFakePluginHost({ pluginId: "fx" });
+  hosts.push(host);
+  return host;
+}
+
 function register() {
-  const { bb, harness } = createFakePluginHost({ pluginId: "fx" });
+  const { bb, harness } = createHost();
   plugin(bb);
-  return harness.registrations.providerRegistrations;
+  return harness.inspection.registrations.providerRegistrations;
 }
 
 /** The `acpLaunchSpec` as the shared ACP bridge receives it from BB. */
@@ -32,6 +49,7 @@ describe("fx provider registration", () => {
 
     expect(registration?.family).toBe("acp");
     expect(registration?.experimental_bridgeOptions).toEqual({
+      acpDialect: "generic",
       acpLaunchSpec: {
         displayName: "fx",
         command: "fx",
@@ -83,9 +101,11 @@ describe("fx provider registration", () => {
   });
 
   it("uses no experimental registration or bridge-authoring API", () => {
-    const { bb, harness } = createFakePluginHost({ pluginId: "fx" });
+    const { bb, harness } = createHost();
     expect(() => plugin(bb)).not.toThrow();
-    expect(harness.registrations.providerRegistrations).toHaveLength(1);
+    expect(harness.inspection.registrations.providerRegistrations).toHaveLength(
+      1,
+    );
   });
 });
 
@@ -159,4 +179,15 @@ describe("launch spec contract", () => {
       false,
     );
   });
+});
+
+it("depends only on the public SDK and declared packages", () => {
+  const scan = experimental_scanPublicSdkOnly(
+    fileURLToPath(new URL("..", import.meta.url)),
+    {
+      allow: [/^vitest(?:\/config)?$/],
+    },
+  );
+  expect(scan.violations).toEqual([]);
+  expect(scan.privateDependencies).toEqual([]);
 });

@@ -1,28 +1,20 @@
-import type { BbPluginApi, PluginProviderDeclaration } from "@get-bb/plugin-sdk";
+import type {
+  BbPluginApi,
+  PluginProviderDeclaration,
+} from "@get-bb/plugin-sdk";
 
 /**
- * The environment BB pins on every `fx acp` process.
- *
- * fx defaults to `FX_PERMISSION_MODE=auto`, which resolves sensitive tool
- * calls *inside fx* — it reviews each one itself and returns a failed tool
- * result on a non-allow — so the ACP `session/request_permission` request
- * never reaches BB. That would make the declared `accept-edits` and `full`
- * modes cosmetic. `ask` is the mode that hands every unresolved sensitive
- * call to the client, which is the shared bridge, which is BB. fx's
- * configured rules and session grants still short-circuit ahead of it, and
- * fx's own tool admission stays authoritative; `ask` only moves the decision
- * BB is supposed to own back to BB.
- *
- * Pinned rather than inherited: an `FX_PERMISSION_MODE=yolo` left in a
- * developer's shell would otherwise silently disable fx's permission policy
- * for every BB thread on that machine.
+ * Pin ask mode so fx forwards unresolved permission requests to BB even when
+ * the host shell sets a permissive default. fx's own rules, session grants,
+ * and tool admission still apply before a request reaches the client.
  */
 const FX_ENV = { FX_PERMISSION_MODE: "ask" } as const;
 
 /**
  * How BB launches fx. `fx acp` speaks the Agent Client Protocol, which the
  * SDK's shared ACP bridge already implements end to end, so this plugin
- * declares the launch and lets that bridge do the talking (see host.ts).
+ * declares the launch and lets that bridge do the talking. host.ts normalizes
+ * the order of fx's model config options before the shared bridge reads them.
  *
  * No `modelCli`: fx's own `fx models --json` omits models the account can
  * still select (the account default among them), while `session/new` returns
@@ -30,9 +22,8 @@ const FX_ENV = { FX_PERMISSION_MODE: "ask" } as const;
  * makes the bridge discover models from the agent itself, which is the
  * complete list.
  *
- * No `reasoningCli` / `nativeReasoning`: fx 0.0.6 exposes no reasoning
- * configuration, on the command line or in its session config options
- * (`session/new` reports `provider`, `model` and `mode`, nothing else).
+ * No `reasoningCli` / `nativeReasoning`: fx 0.0.7 session configuration
+ * reports `provider`, `model` and `mode`, with no reasoning option.
  *
  * No `permissionCli`: fx takes its permission mode from the environment, not
  * from a command-line flag, so the mode is pinned in `env` above.
@@ -51,8 +42,7 @@ export const fxProviderDeclaration: PluginProviderDeclaration = {
   // Grouped with the other ACP agents, which is what fx is and which bridge
   // runs it.
   family: "acp",
-  // app.tsx registers the same mark as a theme-aware component, which BB
-  // prefers over this file logo wherever it is available.
+  // BB renders the monochrome SVG as a mask that follows the current theme.
   icon: "./assets/fx.svg",
   strings: {
     signInHint: "Run `fx login` on the machine to sign in.",
@@ -60,6 +50,7 @@ export const fxProviderDeclaration: PluginProviderDeclaration = {
     installUrl: "https://fx.sh/",
   },
   experimental_bridgeOptions: {
+    acpDialect: "generic",
     acpLaunchSpec: {
       ...FX_LAUNCH_SPEC,
       args: [...FX_LAUNCH_SPEC.args],
