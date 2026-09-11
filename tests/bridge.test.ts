@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -60,6 +60,9 @@ function launchBridge(cwd: string) {
     );
   }
   return {
+    pid: child.pid!,
+    signal: (signal: "SIGTERM" | "SIGINT") => child.kill(signal),
+    endInput: () => child.stdin.end(),
     messages,
     send,
     waitFor,
@@ -331,3 +334,86 @@ it("preserves shared-bridge model request validation errors", async () => {
   );
   expect(response.error).toMatchObject({ code: -32602 });
 });
+
+// Linux exposes both process ancestry and zombie state in /proc, letting this
+// check distinguish a stopped process from a live orphan without timing guesses.
+function processState(pid: number) {
+  try {
+    const fields = readFileSync(`/proc/${pid}/stat`, "utf8")
+      .split(") ")[1]!
+      .split(" ");
+    return { state: fields[0], parent: Number(fields[1]) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+it
+  .skipIf(process.platform !== "linux")
+  .each(["EOF", "SIGTERM", "SIGINT"] as const)(
+  "cleans up a stalled model probe on %s",
+  async (shutdown) => {
+    const pidFile = join(cwd, "stalled-acp.pid");
+    const descendants: number[] = [];
+    try {
+      bridge.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "stalled-model-list",
+          method: "model/list",
+          params: {
+            cwd,
+            providerOptions: {
+              ...providerOptions,
+              acpLaunchSpec: {
+                ...(providerOptions.acpLaunchSpec as object),
+                args: [
+                  fileURLToPath(
+                    new URL("./fixtures/stalled-acp.mjs", import.meta.url),
+                  ),
+                  pidFile,
+                ],
+              },
+            },
+          },
+        }),
+      );
+      await expect
+        .poll(() => existsSync(pidFile), { timeout: 5000 })
+        .toBe(true);
+      let pid = Number(readFileSync(pidFile, "utf8"));
+      while (pid !== bridge.pid && descendants.length < 3) {
+        expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+        descendants.push(pid);
+        pid = processState(pid)?.parent ?? 0;
+      }
+      // Agent, ACP adapter, and isolated catalog bridge are all running before
+      // shutdown; the test must observe their exit, not an earlier launch error.
+      expect(descendants).toHaveLength(3);
+      expect(pid).toBe(bridge.pid);
+      if (shutdown === "EOF") bridge.endInput();
+      else expect(bridge.signal(shutdown)).toBe(true);
+      await expect
+        .poll(
+          () =>
+            [bridge.pid, ...descendants].filter((candidate) => {
+              const state = processState(candidate);
+              return state && state.state !== "Z";
+            }),
+          { timeout: 2000 },
+        )
+        .toEqual([]);
+    } finally {
+      // A failing regression must not leave the fixture's orphan processes.
+      for (const pid of descendants) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* Already exited. */
+        }
+      }
+    }
+  },
+  10_000,
+);

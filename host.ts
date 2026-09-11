@@ -22,12 +22,21 @@ if (process.argv[1] === modulePath && process.argv[2] === adapterFlag) {
   runFxAcp(command, process.argv.slice(4));
 }
 
+let closing = false;
+function closeBridge(): void {
+  if (closing) return;
+  closing = true;
+  modelCatalog.close();
+  experimental_acpProviderBridge.onClose?.();
+}
+
 export const experimental_providerBridge = {
   ...experimental_acpProviderBridge,
-  onClose(): void {
-    modelCatalog.close();
-    experimental_acpProviderBridge.onClose?.();
-  },
+  // The SDK bootstrap only hooks signals declared by the entry. Signals and
+  // stdin closure must all release detached model probes before the SDK exits.
+  onClose: closeBridge,
+  onSigterm: closeBridge,
+  onSigint: closeBridge,
   handleLine(line: string): void {
     try {
       const message = JSON.parse(line);
