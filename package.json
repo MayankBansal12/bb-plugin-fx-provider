@@ -1,10 +1,10 @@
 {
   "name": "bb-plugin-fx",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "engines": {
-    "bb": ">=0.39",
-    "bbPluginSdk": ">=0.4.8"
+    "bb": ">=0.42.1",
+    "bbPluginSdk": ">=0.4.47"
   },
   "bb": {
     "name": "fx",
@@ -13,7 +13,6 @@
       "icon": "./assets/fx.svg"
     },
     "server": "./server.ts",
-    "app": "./app.tsx",
     "host": "./host.ts",
     "skills": []
   },
@@ -33,16 +32,19 @@
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check:managed": "node scripts/check-managed-build.mjs",
+    "check": "npm run typecheck && npm test && npm run check:managed",
+    "pretest": "npm run build"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.4.8",
+    "@get-bb/plugin-sdk": "0.4.47",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "bb-app": "0.39.0",
+    "bb-app": "0.42.1",
+    "cron-parser": "^5.5.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.11"
   }

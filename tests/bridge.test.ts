@@ -1,831 +1,419 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import {
-  PROVIDER_BRIDGE_PROTOCOL_VERSION,
-  threadEventNotificationSchema,
-} from "@get-bb/plugin-sdk/provider-bridge";
-import { beforeEach, describe, expect, it } from "vitest";
-import {
-  createFxProviderBridge,
-  type FxBridgeDependencies,
-} from "../src/bridge.js";
-import type {
-  AcpConnection,
-  AcpConnectionOptions,
-} from "../src/acp-client.js";
+  experimental_resolveProviderBridgeLaunch,
+  experimental_runBridgeConformance,
+  experimental_formatConformanceReport,
+  type BridgeJsonRpcOutputMessage,
+} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { afterEach, beforeEach, expect, it } from "vitest";
+import { fxProviderDeclaration } from "../server.js";
 
-interface RpcMessage {
-  jsonrpc: "2.0";
-  id?: string | number;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: unknown;
-  error?: { code: number; message: string };
-}
-
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: Error): void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
+function launchBridge(cwd: string) {
+  const launch = experimental_resolveProviderBridgeLaunch({
+    modulePath: fileURLToPath(new URL("../dist/host.js", import.meta.url)),
+    pluginId: "fx",
+    cwd,
+    dataDir: join(cwd, "data"),
   });
-  return { promise, resolve, reject };
-}
-
-class FakeAcpConnection implements AcpConnection {
-  readonly calls: Array<{ method: string; params: unknown; timeoutMs?: number }> = [];
-  readonly prompt = deferred<unknown>();
-  readonly options: AcpConnectionOptions;
-  readonly sessionId: string;
-  closed = false;
-  /** ACP methods this fake should reject, keyed by method name. */
-  static failMethods = new Set<string>();
-  /** Extra `session/new`/`session/resume` result fields, e.g. `configOptions`. */
-  static newSessionResult: Record<string, unknown> = {};
-
-  constructor(options: AcpConnectionOptions, sessionId: string) {
-    this.options = options;
-    this.sessionId = sessionId;
-  }
-
-  request(method: string, params: unknown = {}, timeoutMs?: number): Promise<unknown> {
-    this.calls.push({ method, params, timeoutMs });
-    if (FakeAcpConnection.failMethods.has(method)) {
-      return Promise.reject(new Error(`fx rejected ${method}`));
+  const child = spawn(launch.command, launch.args, {
+    cwd: launch.cwd,
+    // The launch spec must override a permissive mode inherited from a host.
+    env: { ...process.env, ...launch.env, FX_PERMISSION_MODE: "yolo" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const messages: BridgeJsonRpcOutputMessage[] = [];
+  let stderr = "";
+  let spawnError: Error | undefined;
+  child.on("error", (error) => {
+    spawnError = error;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + String(chunk)).slice(-8000);
+  });
+  const lines = createInterface({ input: child.stdout });
+  lines.on("line", (line) => {
+    messages.push(JSON.parse(line));
+  });
+  const send = (line: string) => {
+    child.stdin.write(`${line}\n`);
+  };
+  let serial = 0;
+  async function waitFor(
+    predicate: (message: BridgeJsonRpcOutputMessage) => boolean,
+  ) {
+    for (let i = 0; i < 500; i++) {
+      const found = messages.find(predicate);
+      if (found) return found;
+      if (spawnError) throw spawnError;
+      if (child.exitCode !== null) throw new Error(`Bridge exited: ${stderr}`);
+      await delay(10);
     }
-    switch (method) {
-      case "initialize":
-        return Promise.resolve({ protocolVersion: 1 });
-      case "session/new":
-      case "session/resume":
-        return Promise.resolve({
-          sessionId: this.sessionId,
-          ...FakeAcpConnection.newSessionResult,
-        });
-      case "session/prompt":
-        return this.prompt.promise;
-      default:
-        return Promise.resolve(null);
-    }
-  }
-
-  notify(method: string, params: unknown = {}): void {
-    this.calls.push({ method, params });
-  }
-
-  close(): Promise<void> {
-    this.closed = true;
-    this.prompt.resolve({ stopReason: "cancelled" });
-    return Promise.resolve();
-  }
-
-  update(update: Record<string, unknown>): void {
-    this.options.onNotification({
-      jsonrpc: "2.0",
-      method: "session/update",
-      params: { sessionId: this.sessionId, update },
-    });
-  }
-}
-
-const executionOptions = {
-  model: "zai/glm-5.2",
-  reasoningLevel: "medium" as const,
-  permissionMode: "auto" as const,
-  permissionScope: "workspace" as const,
-  permissionEscalation: "ask" as const,
-  approvalReviewer: "automatic" as const,
-  instructions: "Keep changes minimal.",
-};
-
-function tick(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-describe("fx provider bridge", () => {
-  let output: RpcMessage[];
-  let connections: FakeAcpConnection[];
-  let bridge: ReturnType<typeof createFxProviderBridge>;
-
-  beforeEach(() => {
-    output = [];
-    connections = [];
-    FakeAcpConnection.failMethods = new Set();
-    FakeAcpConnection.newSessionResult = {};
-    const dependencies: FxBridgeDependencies = {
-      write(line) {
-        output.push(JSON.parse(line.trim()) as RpcMessage);
-      },
-      async createConnection(options) {
-        const connection = new FakeAcpConnection(
-          options,
-          `fx-session-${connections.length + 1}`,
-        );
-        connections.push(connection);
-        return connection;
-      },
-      async loadModels() {
-        const model = {
-          id: "zai/glm-5.2",
-          model: "zai/glm-5.2",
-          displayName: "GLM 5.2",
-          description: "fx model",
-          supportedReasoningEfforts: [],
-          defaultReasoningEffort: "medium" as const,
-          isDefault: true,
-        };
-        return { models: [model], selectedOnlyModels: [] };
-      },
-    };
-    bridge = createFxProviderBridge(dependencies);
-  });
-
-  function send(id: number, method: string, params: unknown): void {
-    bridge.handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-  }
-
-  async function initialize(): Promise<void> {
-    send(1, "initialize", {
-      protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
-      client: { name: "test", version: "1" },
-    });
-    await tick();
-    output = [];
-  }
-
-  async function startThread(threadId = "thread-1"): Promise<FakeAcpConnection> {
-    send(2, "thread/start", {
-      cwd: "/tmp",
-      instructionMode: "append",
-      options: executionOptions,
-      threadId,
-    });
-    await tick();
-    await tick();
-    return connections.at(-1)!;
-  }
-
-  it("negotiates the canonical protocol and rejects unknown methods", async () => {
-    send(1, "initialize", {
-      protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
-      client: { name: "test", version: "1" },
-    });
-    await tick();
-    expect(output[0]?.result).toEqual({
-      protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
-      capabilities: {
-        approvalEnforcedBy: "provider",
-        fork: "none",
-        sessionRestore: true,
-        threadArchive: false,
-        threadGoalClear: false,
-        threadRename: false,
-      },
-    });
-
-    send(2, "unknown/method", {});
-    await tick();
-    expect(output.at(-1)?.error?.code).toBe(-32601);
-  });
-
-  it("returns INVALID_PARAMS for malformed canonical requests", async () => {
-    await initialize();
-    send(2, "thread/start", { threadId: "missing-fields" });
-    await tick();
-    expect(output[0]?.error?.code).toBe(-32602);
-  });
-
-  it("lists fx models through the canonical result shape", async () => {
-    await initialize();
-    send(2, "model/list", { cwd: "/tmp" });
-    await tick();
-    expect(output[0]?.result).toMatchObject({
-      models: [{ id: "zai/glm-5.2", isDefault: true }],
-      selectedOnlyModels: [],
-    });
-  });
-
-  it("establishes identity before start resolves and configures GLM 5.2", async () => {
-    await initialize();
-    const connection = await startThread();
-    const identityIndex = output.findIndex(
-      (message) =>
-        message.method === "thread/event" &&
-        (message.params?.event as { type?: string })?.type === "thread/identity",
+    throw new Error(
+      `Bridge timed out: ${stderr}\n${JSON.stringify(messages).slice(-8000)}`,
     );
-    const responseIndex = output.findIndex((message) => message.id === 2);
-    expect(identityIndex).toBeGreaterThanOrEqual(0);
-    expect(responseIndex).toBeGreaterThan(identityIndex);
-    expect(connection.calls).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ method: "initialize" }),
-        expect.objectContaining({ method: "session/new" }),
-        expect.objectContaining({
-          method: "session/set_config_option",
-          params: expect.objectContaining({
-            configId: "model",
-            value: "zai/glm-5.2",
-          }),
-        }),
-      ]),
-    );
-    // fx's "code" mode routes approvals to its own auto-mode classifier, which
-    // cannot escalate over ACP and denies every shell command. The session must
-    // stay in the default "ask" mode so approvals reach this bridge.
-    expect(
-      connection.calls.some((call) => call.method === "session/set_mode"),
-    ).toBe(false);
-    expect(connection.options.env.FX_PERMISSION_MODE).toBe("ask");
-  });
-
-  it("derives reasoning support from fx's config report and forwards the level", async () => {
-    await initialize();
-    // fx reports a `thought_level` config option; the bridge must surface the
-    // levels it actually declares and forward the selected one at turn start.
-    FakeAcpConnection.newSessionResult = {
-      configOptions: [
-        {
-          id: "thought_level",
-          category: "thought_level",
-          currentValue: "high",
-          options: [
-            { value: "none", name: "None" },
-            { value: "low", name: "Low" },
-            { value: "medium", name: "Medium" },
-            { value: "high", name: "High" },
-          ],
-        },
-      ],
-    };
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Say hello" }],
-      options: { ...executionOptions, reasoningLevel: "high" },
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-    expect(
-      connection.calls.some(
-        (call) =>
-          call.method === "session/set_config_option" &&
-          call.params !== undefined &&
-          (call.params as { configId?: string }).configId === "thought_level" &&
-          (call.params as { value?: string }).value === "high",
-      ),
-    ).toBe(true);
-  });
-
-  it("stays on the agent-managed fallback when fx exposes no reasoning option", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Say hello" }],
-      options: { ...executionOptions, reasoningLevel: "high" },
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-    // No reasoning config option → the bridge must not fabricate a set_config
-    // call for a level fx does not understand.
-    expect(
-      connection.calls.some(
-        (call) =>
-          call.method === "session/set_config_option" &&
-          call.params !== undefined &&
-          (call.params as { configId?: string }).configId !== "model",
-      ),
-    ).toBe(false);
-  });
-
-  it("translates streamed messages, tools, recovery, and completion", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Say hello" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-
-    connection.update({
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "Hello" },
-    });
-    connection.update({
-      sessionUpdate: "tool_call",
-      toolCallId: "tool-1",
-      title: "Read package.json",
-      kind: "read",
-      status: "pending",
-    });
-    connection.update({
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tool-1",
-      status: "completed",
-      content: [
-        { type: "content", content: { type: "text", text: "read ok" } },
-      ],
-    });
-    connection.update({
-      sessionUpdate: "session_info_update",
-      // Shape copied from a live `fx acp` 0.0.4 session.
-      _meta: {
-        fx: {
-          modelResponseRecovery: {
-            state: "active",
-            kind: "auto_retry",
-            cause: "provider_unavailable",
-            attempt: 2,
-            attemptLimit: 5,
-            message: "The model returned 503; retrying.",
-          },
-        },
-      },
-    });
-    connection.update({
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: " again." },
-    });
-    connection.prompt.resolve({ stopReason: "end_turn" });
-    await tick();
-
-    const notifications = output.filter(
-      (message) => message.method === "thread/event",
-    );
-    for (const notification of notifications) {
-      const parsed = threadEventNotificationSchema.safeParse(notification.params);
+  }
+  return {
+    pid: child.pid!,
+    signal: (signal: "SIGTERM" | "SIGINT") => child.kill(signal),
+    endInput: () => child.stdin.end(),
+    messages,
+    send,
+    waitFor,
+    takeMessages: () => messages.splice(0),
+    async request(method: string, params: unknown) {
+      const id = ++serial;
+      send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      const response = await waitFor(
+        (message) => message.id === id && !message.method,
+      );
       expect(
-        parsed.success,
-        parsed.success ? undefined : JSON.stringify(parsed.error.issues, null, 2),
-      ).toBe(true);
-    }
-    const types = notifications.map(
-      (message) => (message.params?.event as { type: string }).type,
-    );
-    expect(types).toEqual([
-      "turn/input/accepted",
-      "turn/started",
-      "item/started",
-      "item/agentMessage/delta",
-      "item/completed",
-      "item/started",
-      "item/toolCall/progress",
-      "item/completed",
-      "provider/warning",
-      "item/started",
-      "item/agentMessage/delta",
-      "item/completed",
-      "turn/completed",
-    ]);
-    expect(connection.calls.at(-1)).toMatchObject({
-      method: "session/prompt",
-      timeoutMs: 0,
-    });
-    expect(JSON.stringify(connection.calls.at(-1)?.params)).toContain(
-      "Keep changes minimal.",
-    );
-  });
+        response.error,
+        `${method}: ${JSON.stringify(response.error)}`,
+      ).toBeUndefined();
+      return response.result;
+    },
+    async close() {
+      lines.close();
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.stdin.end();
+      const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+      try {
+        await exited;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
 
-  it("resumes the requested fx session", async () => {
-    await initialize();
-    send(2, "thread/resume", {
-      cwd: "/tmp",
-      instructionMode: "append",
-      options: executionOptions,
-      providerThreadId: "existing-fx-session",
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-    expect(connections[0]?.calls).toContainEqual(
+let cwd: string;
+let bridge: ReturnType<typeof launchBridge>;
+let providerOptions: Record<string, unknown>;
+
+beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), "fx-bridge-test-"));
+  const declared = fxProviderDeclaration.experimental_bridgeOptions!;
+  providerOptions = {
+    ...declared,
+    acpLaunchSpec: {
+      ...(declared.acpLaunchSpec as Record<string, unknown>),
+      // Only substitute the executable; all plugin launch policy stays intact.
+      command: process.execPath,
+      args: [fileURLToPath(new URL("./fixtures/fx-acp.mjs", import.meta.url))],
+    },
+  };
+  bridge = launchBridge(cwd);
+});
+afterEach(async () => {
+  await bridge.close();
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+function options(full = false) {
+  return {
+    ...(full
+      ? {
+          permissionMode: "full",
+          permissionScope: "full",
+          approvalReviewer: null,
+          permissionEscalation: null,
+        }
+      : {
+          permissionMode: "accept-edits",
+          permissionScope: "workspace",
+          approvalReviewer: "user",
+          permissionEscalation: "ask",
+        }),
+    model: "alternate",
+    providerOptions,
+  };
+}
+
+it("passes the SDK's canonical bridge conformance suite", async () => {
+  const report = await experimental_runBridgeConformance({
+    transport: bridge,
+    providerId: "fx",
+    session: {
+      cwd,
+      options: options(),
+      promptInput: [{ type: "text", text: "hello", mentions: [] }],
+      zeroWorkPromptInput: [{ type: "text", text: "/noop", mentions: [] }],
+    },
+    timeoutMs: 5000,
+  });
+  expect(report.passed, experimental_formatConformanceReport(report)).toBe(
+    true,
+  );
+  for (const id of [
+    "handshake/initialize",
+    "session/start-identity",
+    "session/resume-identity",
+    "turn/lifecycle",
+    "events/schema-valid",
+    "stop/release-not-interrupted",
+  ]) {
+    expect(report.results.find((result) => result.id === id)?.status, id).toBe(
+      "pass",
+    );
+  }
+}, 30_000);
+
+it("discovers the account default from ACP session configuration", async () => {
+  const result = await bridge.request("model/list", { cwd, providerOptions });
+  expect(result).toMatchObject({
+    models: expect.arrayContaining([
       expect.objectContaining({
-        method: "session/resume",
-        params: expect.objectContaining({ sessionId: "existing-fx-session" }),
+        id: "account-default",
+        isDefault: true,
+        supportedReasoningEfforts: [],
       }),
-    );
-  });
-
-  it("releases without fabricating terminal turn events", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Wait" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    output = [];
-    send(4, "thread/stop", {
-      activeTurnId: "active",
-      intent: "release",
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    expect(connection.closed).toBe(true);
-    expect(output.filter((message) => message.method === "thread/event")).toEqual([]);
-    expect(output.at(-1)?.result).toEqual({ ok: true });
-  });
-
-  it("maps fx cancellation to an interrupted turn", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Wait" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    send(4, "thread/stop", {
-      activeTurnId: "active",
-      intent: "interrupt",
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    connection.prompt.resolve({ stopReason: "cancelled" });
-    await tick();
-    await tick();
-    await tick();
-    const completed = output.find(
-      (message) =>
-        message.method === "thread/event" &&
-        (message.params?.event as { type?: string })?.type === "turn/completed",
-    );
-    expect(
-      completed?.params?.event,
-      JSON.stringify(output, null, 2),
-    ).toMatchObject({ status: "interrupted" });
-    expect(output.find((message) => message.id === 4)?.result).toEqual({ ok: true });
-  });
-
-  it("approves permission requests with the single-use allow option", async () => {
-    await initialize();
-    const connection = await startThread();
-    const outcome = connection.options.onRequest?.({
-      jsonrpc: "2.0",
-      id: 7,
-      method: "session/request_permission",
-      params: {
-        sessionId: connection.sessionId,
-        options: [
-          { optionId: "always", kind: "allow_always" },
-          { optionId: "once", kind: "allow_once" },
-          { optionId: "no-thanks", kind: "reject_once" },
-        ],
-      },
-    });
-    expect(outcome).toEqual({
-      outcome: { outcome: "selected", optionId: "once" },
-    });
-  });
-
-  it("falls back to a broader allow option when no single-use one is offered", async () => {
-    await initialize();
-    const connection = await startThread();
-    const outcome = connection.options.onRequest?.({
-      jsonrpc: "2.0",
-      id: 8,
-      method: "session/request_permission",
-      params: {
-        sessionId: connection.sessionId,
-        options: [
-          { optionId: "always", kind: "allow_always" },
-          { optionId: "no-thanks", kind: "reject_once" },
-        ],
-      },
-    });
-    expect(outcome).toEqual({
-      outcome: { outcome: "selected", optionId: "always" },
-    });
-  });
-
-  it("cancels permission requests that offer no allow option", async () => {
-    await initialize();
-    const connection = await startThread();
-    const outcome = connection.options.onRequest?.({
-      jsonrpc: "2.0",
-      id: 9,
-      method: "session/request_permission",
-      params: {
-        sessionId: connection.sessionId,
-        options: [{ optionId: "no-thanks", kind: "reject_once" }],
-      },
-    });
-    expect(outcome).toEqual({ outcome: { outcome: "cancelled" } });
-  });
-
-  it("marks unfinished tools interrupted when a turn completes successfully", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Go" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    connection.update({
-      sessionUpdate: "tool_call",
-      toolCallId: "tool-never-finished",
-      title: "Stuck tool",
-      kind: "execute",
-      status: "pending",
-    });
-    connection.prompt.resolve({ stopReason: "end_turn" });
-    await tick();
-    const toolCompletions = output.filter(
-      (message) =>
-        message.method === "thread/event" &&
-        (message.params?.event as { type?: string })?.type ===
-          "item/completed" &&
-        ((message.params?.event as { item?: { type?: string } })?.item
-          ?.type === "toolCall"),
-    );
-    expect(toolCompletions).toHaveLength(1);
-    expect(toolCompletions[0]?.params?.event).toMatchObject({
-      item: { status: "interrupted" },
-    });
-  });
-
-  it("resumes the durable fx session transparently after a process crash", async () => {
-    await initialize();
-    await initialize();
-    const crashed = await startThread();
-    crashed.options.onExit(new Error("fx acp exited with code 1"));
-    await tick();
-    const warning = output.find(
-      (message) =>
-        message.method === "thread/event" &&
-        (message.params?.event as { type?: string })?.type ===
-          "provider/warning",
-    );
-    expect(warning?.params?.event).toMatchObject({
-      summary: "The fx process exited unexpectedly.",
-    });
-
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Hello again" }],
-      options: executionOptions,
-      providerThreadId: crashed.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-
-    expect(connections).toHaveLength(2);
-    const replacement = connections[1]!;
-    expect(replacement.closed).toBe(false);
-    expect(replacement.calls).toContainEqual(
       expect.objectContaining({
-        method: "session/resume",
-        params: expect.objectContaining({ sessionId: crashed.sessionId }),
+        id: "alternate",
+        supportedReasoningEfforts: [],
       }),
-    );
-    expect(output.find((message) => message.id === 3)?.result).toEqual({
-      threadId: "thread-1",
-    });
-  });
-
-  it("does not auto-resume after an explicit release", async () => {
-    await initialize();
-    const released = await startThread();
-    send(3, "thread/stop", {
-      activeTurnId: "active",
-      intent: "release",
-      providerThreadId: released.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    output = [];
-    send(4, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Hello?" }],
-      options: executionOptions,
-      providerThreadId: released.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-    expect(connections).toHaveLength(1);
-    expect(output.find((message) => message.id === 4)?.error?.code).toBeDefined();
-  });
-
-  it("releases the fx process when BB discards the thread", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "thread/discard", {
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    expect(output.find((message) => message.id === 3)?.result).toEqual({ ok: true });
-    expect(connection.closed).toBe(true);
-
-    // A discarded thread must not be resurrected by the crash-recovery path.
-    output = [];
-    send(4, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Still there?" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-    expect(connections).toHaveLength(1);
-    expect(output.find((message) => message.id === 4)?.error?.code).toBeDefined();
-  });
-
-  it("reports fx recovery detail instead of a bare refusal", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Go" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    connection.update({
-      sessionUpdate: "session_info_update",
-      _meta: {
-        fx: {
-          modelResponseRecovery: {
-            state: "paused",
-            kind: "terminal_provider_error",
-            cause: "provider_unavailable",
-            attempt: 10,
-            attemptLimit: 10,
-            message: "Provider unavailable · HTTP 503 · recover later",
-          },
-        },
-      },
-    });
-    // fx answers a terminal provider failure with `refused`, the same stop
-    // reason it uses for a genuine model refusal.
-    connection.prompt.resolve({ stopReason: "refused" });
-    await tick();
-
-    const completed = output.find(
-      (message) =>
-        (message.params?.event as { type?: string })?.type === "turn/completed",
-    );
-    expect(completed?.params?.event).toMatchObject({
-      status: "failed",
-      error: {
-        message:
-          "fx could not complete the turn: Provider unavailable · HTTP 503 · recover later",
-      },
-    });
-    const providerError = output.find(
-      (message) =>
-        (message.params?.event as { type?: string })?.type === "provider/error",
-    );
-    expect(providerError?.params?.event).toMatchObject({
-      errorInfo: { category: "overloaded" },
-    });
-  });
-
-  it("emits a warning for every fx retry attempt", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Go" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    for (const attempt of [1, 2, 3]) {
-      connection.update({
-        sessionUpdate: "session_info_update",
-        _meta: {
-          fx: {
-            modelResponseRecovery: {
-              state: "active",
-              cause: "provider_unavailable",
-              attempt,
-              attemptLimit: 10,
-              message: `retrying request · attempt ${attempt}/10`,
-            },
-          },
-        },
-      });
-    }
-    connection.prompt.resolve({ stopReason: "end_turn" });
-    await tick();
-
-    const warnings = output.filter(
-      (message) =>
-        (message.params?.event as { type?: string })?.type === "provider/warning",
-    );
-    expect(warnings).toHaveLength(3);
-    expect(warnings[2]?.params?.event).toMatchObject({
-      summary: "fx is recovering the model response (attempt 3/10)",
-    });
-  });
-
-  it("fails the turn when fx rejects the selected model", async () => {
-    await initialize();
-    const connection = await startThread();
-    FakeAcpConnection.failMethods = new Set(["session/set_config_option"]);
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Go" }],
-      options: { ...executionOptions, model: "vendor/not-real" },
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    await tick();
-
-    const completed = output.find(
-      (message) =>
-        (message.params?.event as { type?: string })?.type === "turn/completed",
-    );
-    expect(completed?.params?.event).toMatchObject({
-      status: "failed",
-      error: {
-        message: 'fx rejected the model "vendor/not-real": fx rejected session/set_config_option',
-      },
-    });
-  });
-
-  it("does not restack an unchanged tool progress line", async () => {
-    await initialize();
-    const connection = await startThread();
-    output = [];
-    send(3, "turn/start", {
-      clientRequestId: "creq_23456789ab",
-      input: [{ type: "text", text: "Go" }],
-      options: executionOptions,
-      providerThreadId: connection.sessionId,
-      threadId: "thread-1",
-    });
-    await tick();
-    connection.update({
-      sessionUpdate: "tool_call",
-      toolCallId: "tool-1",
-      title: "Using terminal",
-      kind: "execute",
-      status: "pending",
-    });
-    // fx streams one update per output chunk, all carrying the same title.
-    for (let index = 0; index < 3; index += 1) {
-      connection.update({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tool-1",
-        status: "in_progress",
-      });
-    }
-    connection.update({
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tool-1",
-      title: "Running tests",
-      status: "in_progress",
-    });
-    connection.prompt.resolve({ stopReason: "end_turn" });
-    await tick();
-
-    const progress = output
-      .filter(
-        (message) =>
-          (message.params?.event as { type?: string })?.type ===
-          "item/toolCall/progress",
-      )
-      .map((message) => (message.params?.event as { message: string }).message);
-    expect(progress).toEqual(["Using terminal", "Running tests"]);
+    ]),
   });
 });
+
+it.each([
+  { name: "deny", decision: "deny", expected: "no", full: false },
+  { name: "allow once", decision: "allow_once", expected: "yes", full: false },
+  { name: "full access", decision: null, expected: "yes", full: true },
+])(
+  "honors $name through the bundled bridge",
+  async ({ decision, expected, full }) => {
+    const initialized = await bridge.request("initialize", {
+      client: { name: "fx-test", version: "1" },
+      protocolVersion: 2,
+      grammarVersions: [3, 3],
+    });
+    expect(initialized).toMatchObject({
+      capabilities: { approvalEnforcedBy: "runtime" },
+    });
+    const started = (await bridge.request("thread/start", {
+      threadId: "fx-test",
+      cwd,
+      instructionMode: "append",
+      options: options(full),
+    })) as { providerThreadId: string };
+    await bridge.request("turn/start", {
+      threadId: "fx-test",
+      providerThreadId: started.providerThreadId,
+      clientRequestId: "creq_abcdefghjk",
+      options: options(full),
+      input: [{ type: "text", text: "request-permission", mentions: [] }],
+    });
+    if (decision) {
+      const approval = await bridge.waitFor(
+        (message) => message.method === "interaction/request",
+      );
+      expect(approval.params).toMatchObject({ payload: { kind: "approval" } });
+      bridge.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: approval.id,
+          result: { decision, grantedPermissions: null },
+        }),
+      );
+    }
+    await bridge.waitFor(
+      (message) =>
+        message.method === "thread/delta" &&
+        JSON.stringify(message.params).includes('"kind":"turn.boundary"') &&
+        JSON.stringify(message.params).includes('"status":"completed"'),
+    );
+    expect(
+      bridge.messages.filter(
+        (message) => message.method === "interaction/request",
+      ),
+    ).toHaveLength(full ? 0 : 1);
+    expect(JSON.stringify(bridge.messages)).toContain(`permission:${expected}`);
+  },
+);
+
+it("preserves fx refusals and settles the turn without a protocol error", async () => {
+  const started = (await bridge.request("thread/start", {
+    threadId: "fx-refusal",
+    cwd,
+    instructionMode: "append",
+    options: options(),
+  })) as { providerThreadId: string };
+  await bridge.request("turn/start", {
+    threadId: "fx-refusal",
+    providerThreadId: started.providerThreadId,
+    clientRequestId: "creq_abcdefghjk",
+    options: options(),
+    input: [{ type: "text", text: "refuse", mentions: [] }],
+  });
+  await bridge.waitFor(
+    (message) =>
+      message.method === "thread/delta" &&
+      JSON.stringify(message.params).includes('"kind":"turn.boundary"'),
+  );
+  const output = JSON.stringify(bridge.messages);
+  expect(output).toContain("Fixture account rejection");
+  expect(output).not.toContain('"kind":"provider.error"');
+});
+
+it.each([false, true])(
+  "only offers and forwards reasoning advertised by fx (native: %s)",
+  async (native) => {
+    const spec = providerOptions.acpLaunchSpec as Record<string, unknown>;
+    spec.env = {
+      ...(spec.env as object),
+      FX_FIXTURE_REASONING: native ? "1" : "0",
+    };
+    const catalog = await bridge.request("model/list", {
+      cwd,
+      providerOptions,
+    });
+    expect(catalog).toMatchObject({
+      models: expect.arrayContaining([
+        expect.objectContaining({
+          id: "account-default",
+          supportedReasoningEfforts: [],
+        }),
+        expect.objectContaining({
+          id: "alternate",
+          supportedReasoningEfforts: native
+            ? ["low", "medium", "high"].map((reasoningEffort) =>
+                expect.objectContaining({ reasoningEffort }),
+              )
+            : [],
+        }),
+      ]),
+    });
+    // A stored BB preference must not become an unsupported fx config request.
+    const configured = { ...options(), reasoningLevel: "high" };
+    const started = (await bridge.request("thread/start", {
+      threadId: "fx-reasoning",
+      cwd,
+      instructionMode: "append",
+      options: configured,
+    })) as { providerThreadId: string };
+    await bridge.request("turn/start", {
+      threadId: "fx-reasoning",
+      providerThreadId: started.providerThreadId,
+      clientRequestId: "creq_abcdefghjk",
+      options: configured,
+      input: [{ type: "text", text: "report settings", mentions: [] }],
+    });
+    await bridge.waitFor(
+      (message) =>
+        message.method === "thread/delta" &&
+        JSON.stringify(message.params).includes('"kind":"turn.boundary"'),
+    );
+    expect(JSON.stringify(bridge.messages)).toContain(
+      `model:alternate; effort:${native ? "high" : "auto"}`,
+    );
+    expect(JSON.stringify(bridge.messages)).not.toContain(
+      '"kind":"provider.error"',
+    );
+  },
+);
+
+it("preserves shared-bridge model request validation errors", async () => {
+  bridge.send(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: "bad-model-list",
+      method: "model/list",
+      params: { cwd: 42 },
+    }),
+  );
+  const response = await bridge.waitFor(
+    (message) => message.id === "bad-model-list",
+  );
+  expect(response.error).toMatchObject({ code: -32602 });
+});
+
+// Linux exposes both process ancestry and zombie state in /proc, letting this
+// check distinguish a stopped process from a live orphan without timing guesses.
+function processState(pid: number) {
+  try {
+    const fields = readFileSync(`/proc/${pid}/stat`, "utf8")
+      .split(") ")[1]!
+      .split(" ");
+    return { state: fields[0], parent: Number(fields[1]) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+it
+  .skipIf(process.platform !== "linux")
+  .each(["EOF", "SIGTERM", "SIGINT"] as const)(
+  "cleans up a stalled model probe on %s",
+  async (shutdown) => {
+    const pidFile = join(cwd, "stalled-acp.pid");
+    const descendants: number[] = [];
+    try {
+      bridge.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "stalled-model-list",
+          method: "model/list",
+          params: {
+            cwd,
+            providerOptions: {
+              ...providerOptions,
+              acpLaunchSpec: {
+                ...(providerOptions.acpLaunchSpec as object),
+                args: [
+                  fileURLToPath(
+                    new URL("./fixtures/stalled-acp.mjs", import.meta.url),
+                  ),
+                  pidFile,
+                ],
+              },
+            },
+          },
+        }),
+      );
+      await expect
+        .poll(() => existsSync(pidFile), { timeout: 5000 })
+        .toBe(true);
+      let pid = Number(readFileSync(pidFile, "utf8"));
+      while (pid !== bridge.pid && descendants.length < 3) {
+        expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+        descendants.push(pid);
+        pid = processState(pid)?.parent ?? 0;
+      }
+      // Agent, ACP adapter, and isolated catalog bridge are all running before
+      // shutdown; the test must observe their exit, not an earlier launch error.
+      expect(descendants).toHaveLength(3);
+      expect(pid).toBe(bridge.pid);
+      if (shutdown === "EOF") bridge.endInput();
+      else expect(bridge.signal(shutdown)).toBe(true);
+      await expect
+        .poll(
+          () =>
+            [bridge.pid, ...descendants].filter((candidate) => {
+              const state = processState(candidate);
+              return state && state.state !== "Z";
+            }),
+          { timeout: 2000 },
+        )
+        .toEqual([]);
+    } finally {
+      // A failing regression must not leave the fixture's orphan processes.
+      for (const pid of descendants) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* Already exited. */
+        }
+      }
+    }
+  },
+  10_000,
+);
